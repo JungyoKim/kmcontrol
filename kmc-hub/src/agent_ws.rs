@@ -26,11 +26,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer_ip: String) {
     // 1. 첫 텍스트 프레임 = Hello.
     let agent_id;
     let name;
+    let mut reported_addr: Option<String> = None;
     loop {
         match stream.next().await {
             Some(Ok(Message::Text(txt))) => {
                 match serde_json::from_str::<AgentToHub>(&txt) {
-                    Ok(AgentToHub::Hello { agent_id: id, name: n, provision_token }) => {
+                    Ok(AgentToHub::Hello { agent_id: id, name: n, provision_token, stream_addr }) => {
                         let verified = {
                             let conn = state.0.db.lock();
                             db::verify_agent(&conn, id, &provision_token)
@@ -40,7 +41,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer_ip: String) {
                                 agent_id = id;
                                 // db의 정식 이름 사용(신뢰 원천).
                                 name = db_name;
-                                let _ = n; // Hello가 보고한 이름은 무시.
+                                reported_addr = stream_addr;
                                 break;
                             }
                             _ => {
@@ -75,8 +76,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer_ip: String) {
             AgentConn { name: name.clone(), tx, last_status: None },
         );
     }
-    state.0.agent_addr.lock().insert(agent_id, peer_ip.clone());
-    tracing::info!(%agent_id, %name, %peer_ip, "agent online");
+    // 스트리밍 타겟 주소: agent 가 보고한 tailnet IP 우선, 없으면 WS peer_ip 폴백.
+    // (공개 hub 뒤에서는 peer_ip 가 프록시 내부 IP 라 쓸모없으므로 보고값이 필수.)
+    let stream_addr = reported_addr.clone().unwrap_or_else(|| peer_ip.clone());
+    state.0.agent_addr.lock().insert(agent_id, stream_addr.clone());
+    tracing::info!(%agent_id, %name, %stream_addr, %peer_ip, "agent online");
 
     // HelloOk 전송.
     if send_json(&mut sink, &HubToAgent::HelloOk).await.is_err() {

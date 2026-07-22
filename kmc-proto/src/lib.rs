@@ -54,7 +54,15 @@ pub struct CommandResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentToHub {
-    Hello { agent_id: Uuid, name: String, provision_token: String },
+    Hello {
+        agent_id: Uuid,
+        name: String,
+        provision_token: String,
+        /// agent 가 보고하는 자기 도달 주소(tailnet 100.x). hub 가 세션 주소로 반환한다.
+        /// 없으면 hub 는 WS peer_ip 로 폴백(하위호환).
+        #[serde(default)]
+        stream_addr: Option<String>,
+    },
     Status(StatusReport),
     CommandResult(CommandResult),
 }

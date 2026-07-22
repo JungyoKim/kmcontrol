@@ -62,3 +62,20 @@ pub fn ensure_up(hostname: &str) {
         Err(e) => tracing::warn!(error = %e, "tailscale up spawn failed"),
     }
 }
+
+/// agent 자신의 tailnet IPv4(100.x)를 반환한다. 미연결/미설치면 None.
+/// hub 에 Hello 로 보고해 세션 주소(스트리밍 타겟)로 쓰이게 한다.
+pub fn self_ip() -> Option<String> {
+    let exe = tailscale_path();
+    if !std::path::Path::new(&exe).exists() {
+        return None;
+    }
+    let out = Command::new(&exe).args(["ip", "-4"]).output().ok()?;
+    let ip = String::from_utf8_lossy(&out.stdout).trim().lines().next()?.trim().to_string();
+    // 100.64.0.0/10 (CGNAT, tailnet 대역)만 유효로 간주.
+    if ip.starts_with("100.") {
+        Some(ip)
+    } else {
+        None
+    }
+}

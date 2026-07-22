@@ -46,6 +46,7 @@ async fn connect_once(ws_url: &str, state: &AgentState) -> Result<()> {
         agent_id: state.agent_id,
         name: state.name.clone(),
         provision_token: state.provision_token.clone(),
+        stream_addr: crate::tailscale::self_ip(),
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await
