@@ -51,12 +51,26 @@ fn averr(ret: c_int, ctx: &str) -> Result<()> {
     Ok(())
 }
 
+/// 링 크기: 인코더 in-flight 프레임 수보다 크게(async_depth=1 → ~1-2). D3D11 풀(8)보다 작게.
+const RING_SIZE: usize = 6;
+
+/// 미리 매핑된 슬롯: D3D11 hwframe 와 그에 DIRECT 매핑된 QSV 프레임을 init 에서 한 번만 만들고
+/// 재사용한다(프레임당 av_hwframe_map 제거 = Sunshine 방식). tex/index 는 CopySubresourceRegion 대상.
+struct MappedSlot {
+    d3d11_frame: *mut AVFrame,
+    qsv_frame: *mut AVFrame,
+    tex: *mut c_void, // ID3D11Texture2D*(배열)
+    index: u32,       // subresource(배열 슬라이스) 인덱스
+}
+
 pub struct ZeroCopyEncoder {
     enc: *mut AVCodecContext,
     d3d11_dev: *mut AVBufferRef,
     qsv_dev: *mut AVBufferRef,
     d3d11_frames: *mut AVBufferRef,
     qsv_frames: *mut AVBufferRef,
+    ring: Vec<MappedSlot>, // 미리 매핑된 프레임 링(재사용).
+    ring_pos: usize,
     ctx: ID3D11DeviceContext, // CopySubresourceRegion 용(우리 디바이스 컨텍스트)
     _device: ID3D11Device,    // 우리 ref 유지
     pkt: *mut AVPacket,
@@ -112,7 +126,7 @@ impl ZeroCopyEncoder {
             (*fctx).sw_format = AV_PIX_FMT_NV12;
             (*fctx).width = out_w as c_int;
             (*fctx).height = out_h as c_int;
-            (*fctx).initial_pool_size = 8;
+            (*fctx).initial_pool_size = (RING_SIZE + 2) as c_int;
             let fhw = (*fctx).hwctx as *mut AVD3D11VAFramesContext;
             (*fhw).bind_flags = D3D11_BIND_RENDER_TARGET.0 as u32;
             averr(av_hwframe_ctx_init(d3d11_frames), "d3d11 frames init")?;
@@ -174,6 +188,42 @@ impl ZeroCopyEncoder {
                 bail!("alloc packet failed");
             }
 
+            // 링 사전 매핑: 각 슬롯의 D3D11 hwframe 를 QSV 로 DIRECT 매핑을 한 번만 수행하고
+            // 프레임을 살려둬(map 유지) 매 인코딩마다 재사용한다.
+            let mut ring: Vec<MappedSlot> = Vec::with_capacity(RING_SIZE);
+            for _ in 0..RING_SIZE {
+                let d = av_frame_alloc();
+                if d.is_null() {
+                    bail!("alloc d3d11 ring frame failed");
+                }
+                let r = av_hwframe_get_buffer(d3d11_frames, d, 0);
+                if r < 0 {
+                    av_frame_free(&mut (d as *mut _) as *mut *mut AVFrame);
+                    bail!("ring hwframe_get_buffer(d3d11): {r}");
+                }
+                let q = av_frame_alloc();
+                if q.is_null() {
+                    av_frame_free(&mut (d as *mut _) as *mut *mut AVFrame);
+                    bail!("alloc qsv ring frame failed");
+                }
+                (*q).format = AV_PIX_FMT_QSV as c_int;
+                (*q).hw_frames_ctx = av_buffer_ref(qsv_frames);
+                (*q).width = out_w as c_int;
+                (*q).height = out_h as c_int;
+                let r = av_hwframe_map(q, d, AV_HWFRAME_MAP_DIRECT as c_int);
+                if r < 0 {
+                    av_frame_free(&mut (q as *mut _) as *mut *mut AVFrame);
+                    av_frame_free(&mut (d as *mut _) as *mut *mut AVFrame);
+                    bail!("ring hwframe_map(qsv): {r}");
+                }
+                ring.push(MappedSlot {
+                    d3d11_frame: d,
+                    qsv_frame: q,
+                    tex: (*d).data[0] as *mut c_void,
+                    index: (*d).data[1] as u32,
+                });
+            }
+
             tracing::info!(codec_name, out_w, out_h, fps, "zero-copy GPU encoder ready (d3d11va→qsv DIRECT)");
             Ok(Self {
                 enc,
@@ -181,6 +231,8 @@ impl ZeroCopyEncoder {
                 qsv_dev,
                 d3d11_frames,
                 qsv_frames,
+                ring,
+                ring_pos: 0,
                 ctx: ctx.clone(),
                 _device: device.clone(),
                 pkt,
@@ -194,50 +246,25 @@ impl ZeroCopyEncoder {
     /// NV12 D3D11 텍스처(GpuConverter 출력)를 GPU 상에서 인코딩. CPU 복사 없음.
     pub fn encode(&mut self, nv12_tex: &ID3D11Texture2D, force_idr: bool) -> Result<Vec<EncodedPacket>> {
         unsafe {
-            // ffmpeg D3D11 hwframe 확보(텍스처 배열 슬롯 하나).
-            let d3d11_frame = av_frame_alloc();
-            if d3d11_frame.is_null() {
-                bail!("alloc d3d11 frame failed");
-            }
-            let ret = av_hwframe_get_buffer(self.d3d11_frames, d3d11_frame, 0);
-            if ret < 0 {
-                av_frame_free(&mut (d3d11_frame as *mut _) as *mut *mut AVFrame);
-                bail!("hwframe_get_buffer(d3d11): {ret}");
-            }
+            // 다음 링 슬롯 선택(N 프레임 뒤 재사용 → 이전 제출은 이미 drain 되어 안전).
+            let idx = self.ring_pos;
+            self.ring_pos = (self.ring_pos + 1) % self.ring.len();
+            let tex_ptr = self.ring[idx].tex;
+            let sub_index = self.ring[idx].index;
+            let qf = self.ring[idx].qsv_frame;
 
-            // data[0]=ID3D11Texture2D*(배열), data[1]=배열 인덱스(subresource).
-            let dst_tex_ptr = (*d3d11_frame).data[0] as *mut c_void;
-            let dst_index = (*d3d11_frame).data[1] as u32;
-            // GPU→GPU 복사: 우리 NV12 텍스처 → ffmpeg 텍스처 배열 슬롯. (동일 디바이스)
-            let dst_tex = ID3D11Texture2D::from_raw_borrowed(&dst_tex_ptr)
-                .ok_or_else(|| anyhow!("null hwframe texture"))?;
-            self.ctx.CopySubresourceRegion(dst_tex, dst_index, 0, 0, 0, nv12_tex, 0, None);
+            // GPU→GPU 복사: NV12 텍스처 → 미리 매핑된 슬롯의 D3D11 텍스처(배열 슬라이스). 동일 immediate
+            // context 라 CopySubresourceRegion 과 mfx 인코딩이 순서 보장(명시 flush 불필요).
+            let dst_tex = ID3D11Texture2D::from_raw_borrowed(&tex_ptr)
+                .ok_or_else(|| anyhow!("null ring texture"))?;
+            self.ctx.CopySubresourceRegion(dst_tex, sub_index, 0, 0, 0, nv12_tex, 0, None);
 
-            // QSV 로 DIRECT 매핑.
-            let qsv_frame = av_frame_alloc();
-            if qsv_frame.is_null() {
-                av_frame_free(&mut (d3d11_frame as *mut _) as *mut *mut AVFrame);
-                bail!("alloc qsv frame failed");
-            }
-            (*qsv_frame).format = AV_PIX_FMT_QSV as c_int;
-            (*qsv_frame).hw_frames_ctx = av_buffer_ref(self.qsv_frames);
-            (*qsv_frame).width = self.width as c_int;
-            (*qsv_frame).height = self.height as c_int;
-            let ret = av_hwframe_map(qsv_frame, d3d11_frame, AV_HWFRAME_MAP_DIRECT as c_int);
-            if ret < 0 {
-                av_frame_free(&mut (qsv_frame as *mut _) as *mut *mut AVFrame);
-                av_frame_free(&mut (d3d11_frame as *mut _) as *mut *mut AVFrame);
-                bail!("hwframe_map(qsv): {ret}");
-            }
-            (*qsv_frame).pts = self.pts;
+            // 이미 QSV 로 매핑된 프레임 재제출: 프레임당 alloc/map/free 없음.
+            (*qf).pts = self.pts;
             self.pts += 1;
-            if force_idr {
-                (*qsv_frame).pict_type = AV_PICTURE_TYPE_I;
-            }
+            (*qf).pict_type = if force_idr { AV_PICTURE_TYPE_I } else { AV_PICTURE_TYPE_NONE };
 
-            let sret = avcodec_send_frame(self.enc, qsv_frame);
-            av_frame_free(&mut (qsv_frame as *mut _) as *mut *mut AVFrame);
-            av_frame_free(&mut (d3d11_frame as *mut _) as *mut *mut AVFrame);
+            let sret = avcodec_send_frame(self.enc, qf);
             if sret < 0 {
                 bail!("send_frame: {sret}");
             }
@@ -264,6 +291,17 @@ impl ZeroCopyEncoder {
 impl Drop for ZeroCopyEncoder {
     fn drop(&mut self) {
         unsafe {
+            // 링 프레임 먼저 해제(frames ctx 참조 → 컨텍스트보다 먼저).
+            for slot in self.ring.drain(..) {
+                let mut q = slot.qsv_frame;
+                if !q.is_null() {
+                    av_frame_free(&mut q as *mut *mut AVFrame);
+                }
+                let mut d = slot.d3d11_frame;
+                if !d.is_null() {
+                    av_frame_free(&mut d as *mut *mut AVFrame);
+                }
+            }
             if !self.pkt.is_null() {
                 av_packet_free(&mut self.pkt);
             }
