@@ -158,6 +158,7 @@ pub fn start_stream(
     bitrate_kbps: u32,
     au_tx: std::sync::mpsc::Sender<AuFrame>,
     audio_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    allow_hevc: bool,
 ) -> Result<StreamSession> {
     *AU_SINK.lock() = Some(au_tx);
     *AUDIO_SINK.lock() = Some(audio_tx);
@@ -174,9 +175,14 @@ pub fn start_stream(
         cfg.packetSize = 1392;
         cfg.streamingRemotely = STREAM_CFG_LOCAL as c_int;
         cfg.audioConfiguration = make_stereo_audio_config();
-        // H.264 + HEVC 둘 다 지원 요청. 서버(streamhost)가 HEVC 가능하면 HEVC로 협상되고,
-        // 실제 협상된 포맷은 dr_setup(video_format)으로 확인해 프론트에 전달한다.
-        cfg.supportedVideoFormats = (VIDEO_FORMAT_H264 | VIDEO_FORMAT_H265) as c_int;
+        // H.264 는 항상 지원. HEVC 는 클라이언트(WebCodecs)가 디코드 가능할 때만 요청한다.
+        // 서버가 HEVC 가능하면 HEVC 로 협상되고, 협상 포맷은 dr_setup(video_format)으로 확인해
+        // 프론트에 전달한다. 클라가 HEVC 디코드 불가면 allow_hevc=false → H.264 만 요청(안전 폴백).
+        cfg.supportedVideoFormats = if allow_hevc {
+            (VIDEO_FORMAT_H264 | VIDEO_FORMAT_H265) as c_int
+        } else {
+            VIDEO_FORMAT_H264 as c_int
+        };
         cfg.encryptionFlags = 0;
         cfg.remoteInputAesKey = std::mem::transmute::<[u8; 16], [c_char; 16]>(launch.rikey);
         cfg.remoteInputAesIv = std::mem::transmute::<[u8; 16], [c_char; 16]>(launch.rikey_iv);

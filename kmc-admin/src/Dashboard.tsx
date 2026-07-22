@@ -373,6 +373,24 @@ function codecFromSps(annexb: Uint8Array): string | null {
   return null;
 }
 
+// HEVC Main 프로파일, 레벨 5.1(=153, 4K 커버). streamhost hevc_qsv 출력(Main)과 일치.
+const HEVC_CODEC = "hvc1.1.6.L153.B0";
+
+// 이 WebView(WebCodecs)가 HEVC 를 하드웨어 디코드할 수 있는지 검사. 협상 전에 호출해
+// 불가하면 H.264 만 요청한다(검은 화면 폴백 방지).
+async function hevcSupported(): Promise<boolean> {
+  if (!("VideoDecoder" in window)) return false;
+  try {
+    const r = await VideoDecoder.isConfigSupported({
+      codec: HEVC_CODEC,
+      hardwareAcceleration: "prefer-hardware",
+    } as VideoDecoderConfig);
+    return !!r.supported;
+  } catch {
+    return false;
+  }
+}
+
 // JS KeyboardEvent.code → Windows Virtual-Key 코드(호스트가 그대로 SendInput에 사용).
 function vkFromCode(e: KeyboardEvent): number {
   const c = e.code;
@@ -422,7 +440,17 @@ function StreamView({
     try {
       const addr = await acquire();
       setStatus("연결 중...");
-      await invoke("start_stream", { address: addr, width: 1920, height: 1080, fps: 60, pin: null });
+      // 클라이언트(WebCodecs)가 HEVC 를 디코드할 수 있을 때만 HEVC 협상을 허용한다.
+      // 불가하면 H.264 만 요청해 안전 폴백(디코드 실패로 검은 화면 방지).
+      const allowHevc = await hevcSupported();
+      await invoke("start_stream", {
+        address: addr,
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        pin: null,
+        allowHevc,
+      });
       setStreaming(true);
       setStatus(`스트리밍 중 — ${addr}`);
     } catch (err) {
@@ -487,7 +515,7 @@ function StreamView({
           // HEVC 면 Main 프로파일 코덱 문자열(레벨 5.1=4K 커버), H.264 면 SPS 파싱값.
           const codec =
             streamCodec === "hevc"
-              ? "hvc1.1.6.L153.B0"
+              ? HEVC_CODEC
               : (codecFromSps(data) ?? "avc1.42E01F");
           try {
             decoder.configure({

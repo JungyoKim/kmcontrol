@@ -39,7 +39,7 @@ fn dirs_config() -> Option<PathBuf> {
 
 impl StreamState {
     /// 스트림 시작. paired 상태면 재연결, 아니면 PIN 페어링.
-    pub fn start(&self, address: &str, width: u32, height: u32, fps: u32, pin: Option<String>) -> Result<()> {
+    pub fn start(&self, address: &str, width: u32, height: u32, fps: u32, pin: Option<String>, allow_hevc: bool) -> Result<()> {
         // 이전 세션 정리.
         self.stop();
 
@@ -95,7 +95,7 @@ impl StreamState {
             }
         });
 
-        let session = conn::start_stream(&info, &host, &launch, width, height, fps, 20_000, au_tx, audio_tx)?;
+        let session = conn::start_stream(&info, &host, &launch, width, height, fps, 20_000, au_tx, audio_tx, allow_hevc)?;
         *self.session.lock() = Some(session);
         Ok(())
     }

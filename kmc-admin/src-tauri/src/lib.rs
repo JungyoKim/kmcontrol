@@ -244,9 +244,11 @@ async fn start_stream(
     height: u32,
     fps: u32,
     pin: Option<String>,
+    allow_hevc: Option<bool>,
 ) -> Result<(), String> {
+    let allow_hevc = allow_hevc.unwrap_or(false);
     let st = stream.inner().clone();
-    tokio::task::spawn_blocking(move || st.start(&address, width, height, fps, pin))
+    tokio::task::spawn_blocking(move || st.start(&address, width, height, fps, pin, allow_hevc))
         .await
         .map_err(|e| format!("join: {e}"))?
         .map_err(|e| format!("start_stream: {e}"))
