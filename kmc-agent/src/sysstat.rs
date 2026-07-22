@@ -1,6 +1,19 @@
+use std::sync::OnceLock;
+
 use chrono::Utc;
 use kmc_proto::{ProcessInfo, StatusReport};
 use sysinfo::{Disks, ProcessesToUpdate, System};
+
+/// QSV 인코더 프로브 결과 캐시(1회 실행). 최초 status 수집 시 한 번만 인코더를 열어본다.
+static ENCODER_OK: OnceLock<bool> = OnceLock::new();
+
+fn encoder_ok() -> bool {
+    *ENCODER_OK.get_or_init(|| {
+        let ok = kmc_streamhost::qsv::QsvEncoder::probe_available();
+        tracing::info!(encoder_ok = ok, "QSV hardware encoder probe (Intel)");
+        ok
+    })
+}
 
 use crate::config;
 
@@ -48,6 +61,7 @@ impl Collector {
             disk_total_bytes,
             processes,
             reported_at: Utc::now(),
+            encoder_ok: Some(encoder_ok()),
         }
     }
 }

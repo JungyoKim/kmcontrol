@@ -30,6 +30,12 @@ impl QsvEncoder {
         Self::new_codec("h264_qsv", width, height, fps, bitrate_bps)
     }
 
+    /// QSV 하드웨어 인코더 사용 가능 여부 프로브(작은 인코더를 실제로 열어봄).
+    /// Intel GPU/드라이버(oneVPL/MediaSDK 런타임) 부재·구버전이면 false.
+    pub fn probe_available() -> bool {
+        Self::new_codec("h264_qsv", 128, 128, 30, 1_000_000).is_ok()
+    }
+
     /// 지정 QSV 인코더(`h264_qsv` 또는 `hevc_qsv`) 생성. 저지연 구성.
     /// HEVC 는 동일 대역폭에 H.264 보다 30~50% 선명(고해상도 이득 큼).
     pub fn new_codec(codec_name: &str, width: u32, height: u32, fps: u32, bitrate_bps: u32) -> Result<Self> {

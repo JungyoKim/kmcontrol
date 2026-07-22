@@ -129,7 +129,18 @@ function AgentTable({
               data-state={a.agent_id === selectedId ? "selected" : undefined}
               className="cursor-pointer"
             >
-              <TableCell className="font-medium">{a.name}</TableCell>
+              <TableCell className="font-medium">
+                {a.name}
+                {a.status?.encoder_ok === false && (
+                  <Badge
+                    variant="destructive"
+                    className="ml-2"
+                    title="Intel QSV 하드웨어 인코더 사용 불가 — 그래픽 드라이버 업데이트 필요"
+                  >
+                    ⚠ 인코더
+                  </Badge>
+                )}
+              </TableCell>
               <TableCell>
                 <Badge variant={a.online ? "default" : "secondary"}>
                   {a.online ? "온라인" : "오프라인"}
@@ -430,6 +441,12 @@ function StreamView({
 
   // 연결: 세션 요청(주소 획득) → 그 호스트로 스트림 시작. 노트북 선택 후 버튼 하나로 완결.
   async function start() {
+    if (agent?.status?.encoder_ok === false) {
+      setStatus(
+        "이 노트북은 하드웨어 인코더(Intel QSV)를 쓸 수 없습니다 — Intel 그래픽 드라이버를 업데이트하세요 (10세대+ Intel GPU 필요).",
+      );
+      return;
+    }
     setStatus("세션 요청 중...");
     try {
       const addr = await acquire();
@@ -474,10 +491,13 @@ function StreamView({
     let decoder: VideoDecoder | null = null;
     let configured = false;
     let ts = 0;
+    let gotFrame = false;
+    let gotData = false;
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d") ?? null;
 
     const draw = (frame: VideoFrame) => {
+      gotFrame = true;
       if (canvas && ctx) {
         // codedWidth/Height = 실제 인코딩 해상도(예 2880×1800). displayWidth/visibleRect 는
         // 일부 인코더(hevc_qsv)가 SPS conformance window 를 잘못 써 1280×720 등으로 축소 보고할 수 있어
@@ -511,6 +531,7 @@ function StreamView({
       ws.binaryType = "arraybuffer";
       ws.onmessage = (ev) => {
         if (!alive || !decoder) return;
+        gotData = true;
         const bytes = new Uint8Array(ev.data as ArrayBuffer);
         const key = bytes[0] === 1;
         const data = bytes.subarray(1);
@@ -544,9 +565,20 @@ function StreamView({
       };
     };
     setup();
+    // 영상 무수신 진단: 연결 후 10초 안에 디코드된 프레임이 하나도 없으면 원인을 안내.
+    const noVideoTimer = window.setTimeout(() => {
+      if (alive && !gotFrame) {
+        setStatus(
+          gotData
+            ? "영상 디코드 실패 — 코덱 호환 문제일 수 있습니다(콘솔 로그 확인)."
+            : "영상 없음 — 호스트 인코더를 사용할 수 없습니다. Intel 그래픽 드라이버를 업데이트하세요 (10세대+ Intel GPU 필요).",
+        );
+      }
+    }, 10000);
 
     return () => {
       alive = false;
+      window.clearTimeout(noVideoTimer);
       try {
         ws?.close();
       } catch {

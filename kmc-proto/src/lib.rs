@@ -14,6 +14,10 @@ pub struct StatusReport {
     pub disk_total_bytes: u64,
     pub processes: Vec<ProcessInfo>,    // 메모리 상위 15개
     pub reported_at: DateTime<Utc>,
+    /// 하드웨어 인코더(Intel QSV) 사용 가능 여부. None=미확인(구버전 에이전트).
+    /// false 면 admin 이 "Intel 드라이버 업데이트 필요" 진단을 띄운다.
+    #[serde(default)]
+    pub encoder_ok: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

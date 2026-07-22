@@ -14,6 +14,7 @@ export interface StatusReport {
   disk_total_bytes: number;
   processes: ProcessInfo[];
   reported_at: string; // RFC3339
+  encoder_ok: boolean | null; // Intel QSV 인코더 가용성(null=미확인/구버전)
 }
 
 export interface AgentView {
