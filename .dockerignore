@@ -1,0 +1,32 @@
+# Docker 빌드 컨텍스트 축소 — hub 이미지는 kmc-hub + kmc-proto 소스만 필요.
+# (컨텍스트 = repo 루트이므로 나머지 크레이트/빌드산출물/의존은 전부 제외해 전송량을 줄인다.)
+
+# Rust 빌드 산출물 (모든 크레이트)
+**/target/
+
+# vendored C 소스 (moonlight-common-c 등) — hub 와 무관, 수백 MB
+kmc-mooncommon/vendor/
+
+# hub 빌드에 불필요한 다른 크레이트
+kmc-admin/
+kmc-agent/
+kmc-mcp/
+kmc-moonclient/
+kmc-mooncommon/
+kmc-streamhost/
+
+# 프론트/노드
+**/node_modules/
+**/dist/
+
+# 로컬/비밀/런타임
+.omp/
+*.pem
+provision.env
+**/hub.db*
+**/agent-state.json
+deploy/kmc-agent-bundle.zip
+*.old*.exe
+
+# git
+.git/

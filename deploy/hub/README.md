@@ -21,8 +21,8 @@ hub 는 순수 Rust + `rusqlite`(bundled, SQLite C 정적) 라 시스템 lib 의
 ### 1. 앱 생성 (Application, Dockerfile 빌드)
 - Source: 이 Git 저장소 (`https://github.com/JungyoKim/kmcontrol`), 브랜치 `main`
 - Build Type: **Dockerfile**
-- Dockerfile Path: `deploy/hub/Dockerfile`
-- Build Context / Root: 저장소 루트 (`.`) — kmc-hub 와 kmc-proto 둘 다 필요하므로 루트여야 함
+- Docker File (Dockerfile Path): `deploy/hub/Dockerfile`
+- **Docker Context Path (Build Path): `.`** — repo 루트여야 kmc-hub+kmc-proto 가 보인다. `/` 로 두면 컨텍스트가 비어 `COPY kmc-hub` 가 "not found" 로 실패한다. (`.` 이 안 먹으면 `./` 시도.)
 - Exposed Port: **8080**
 
 ### 2. 볼륨 (DB 영속)
