@@ -701,12 +701,20 @@ function StreamView({
         buf.getChannelData(ch).set(tmp);
       }
       ad.close();
+      const now = ac.currentTime;
+      const TARGET = 0.02; // 목표 지터 버퍼 20ms(저지연).
+      const MAX = 0.1; // 상한 100ms.
+      if (playHead < now) {
+        // 언더런: 뒤처짐 → 목표 리드로 리싱크.
+        playHead = now + TARGET;
+      } else if (playHead - now > MAX) {
+        // 너무 앞섬(초기 버스트/클럭 드리프트) → 이 5ms 프레임 드롭. playHead 유지, now 진행 →
+        // 리드가 실시간으로 줄어 지연을 회수한다(영구 지연 방지 = Sunshine 지터버퍼 상한과 동일 취지).
+        return;
+      }
       const src = ac.createBufferSource();
       src.buffer = buf;
       src.connect(ac.destination);
-      // 약간의 지터 버퍼(60ms)로 언더런 방지. 뒤처지면 현재 시각으로 리셋.
-      const now = ac.currentTime;
-      if (playHead < now + 0.02) playHead = now + 0.06;
       src.start(playHead);
       playHead += buf.duration;
     };
