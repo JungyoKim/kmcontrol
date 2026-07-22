@@ -1,0 +1,30 @@
+# kmc-hub — dokploy "Compose" 배포용.
+#
+# Application(Dockerfile) 타입에서 Build Path 가 repo 루트로 안 잡혀 COPY 가 실패하는 문제를 피한다.
+# compose 의 build.context 는 이 파일 위치(repo 루트) 기준이라 모호함이 없다.
+#
+# dokploy: Compose 타입 앱 생성 → Compose Path = docker-compose.yml (루트) → 아래 environment 를
+#          dokploy Environment 로 주입(또는 이 파일에 직접). 도메인은 dokploy 에서 hub 서비스 8080 에 붙인다.
+
+services:
+  hub:
+    build:
+      context: .
+      dockerfile: deploy/hub/Dockerfile
+    image: kmc-hub:latest
+    restart: unless-stopped
+    ports:
+      - "8080"
+    volumes:
+      - hub-data:/data
+    environment:
+      KMC_HUB_ADDR: "0.0.0.0:8080"
+      KMC_HUB_DB: "/data/hub.db"
+      # enroll (dokploy Environment 로 덮어쓰기 권장 — authkey 는 비밀)
+      KMC_ENROLL_SECRET: "${KMC_ENROLL_SECRET}"
+      KMC_ENROLL_AUTHKEY: "${KMC_ENROLL_AUTHKEY}"
+      KMC_ENROLL_HUB_URL: "${KMC_ENROLL_HUB_URL}"
+      KMC_RELEASE_URL: "${KMC_RELEASE_URL}"
+
+volumes:
+  hub-data:
