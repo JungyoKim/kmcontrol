@@ -25,12 +25,19 @@ pub struct QsvEncoder {
 }
 
 impl QsvEncoder {
-    /// h264_qsv 인코더 생성. `bitrate_bps`, `fps`로 저지연 구성.
+    /// h264_qsv 인코더 생성(하위호환 유지).
     pub fn new(width: u32, height: u32, fps: u32, bitrate_bps: u32) -> Result<Self> {
+        Self::new_codec("h264_qsv", width, height, fps, bitrate_bps)
+    }
+
+    /// 지정 QSV 인코더(`h264_qsv` 또는 `hevc_qsv`) 생성. 저지연 구성.
+    /// HEVC 는 동일 대역폭에 H.264 보다 30~50% 선명(고해상도 이득 큼).
+    pub fn new_codec(codec_name: &str, width: u32, height: u32, fps: u32, bitrate_bps: u32) -> Result<Self> {
         // 전역 1회 초기화(중복 무해).
         ffmpeg::init().map_err(|e| anyhow!("ffmpeg init: {e}"))?;
 
-        let codec = encoder::find_by_name("h264_qsv").ok_or_else(|| anyhow!("h264_qsv not found"))?;
+        let codec = encoder::find_by_name(codec_name)
+            .ok_or_else(|| anyhow!("{codec_name} not found"))?;
         let ctx = codec::context::Context::new_with_codec(codec);
         let mut video = ctx.encoder().video().map_err(|e| anyhow!("encoder video ctx: {e}"))?;
 
@@ -47,12 +54,12 @@ impl QsvEncoder {
 
         let mut opts = Dictionary::new();
         opts.set("preset", "veryfast");
-        opts.set("forced_idr", "1");      // pict_type=I 강제 시 진짜 IDR + SPS/PPS.
+        opts.set("forced_idr", "1");      // pict_type=I 강제 시 진짜 IDR + SPS/PPS(HEVC=VPS/SPS/PPS).
         opts.set("low_delay_brc", "1");   // 저지연 레이트컨트롤.
         opts.set("async_depth", "1");     // 프레임 지연 최소화.
         opts.set("recovery_point_sei", "0");
 
-        let encoder = video.open_with(opts).map_err(|e| anyhow!("open h264_qsv: {e}"))?;
+        let encoder = video.open_with(opts).map_err(|e| anyhow!("open {codec_name}: {e}"))?;
 
         Ok(Self { encoder, width, height, pts: 0, force_idr: false })
     }

@@ -28,19 +28,28 @@ static AU_SINK: Mutex<Option<std::sync::mpsc::Sender<AuFrame>>> = Mutex::new(Non
 static LAST_TERMINATION: Mutex<Option<i32>> = Mutex::new(None);
 /// Opus 오디오 프레임 싱크(단일 활성 세션). decodeAndPlaySample에서 send, admin이 드레인해 WS로 팬아웃.
 static AUDIO_SINK: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>> = Mutex::new(None);
+/// dr_setup 이 관찰한 협상 video_format (VIDEO_FORMAT_H265 이면 HEVC). 프론트가 조회.
+static NEGOTIATED_VIDEO_FORMAT: Mutex<i32> = Mutex::new(0);
+
+/// 협상된 코덱 문자열("hevc" 또는 "h264"). admin 커맨드가 프론트에 전달.
+pub fn negotiated_codec() -> &'static str {
+    let vf = *NEGOTIATED_VIDEO_FORMAT.lock();
+    if vf & (VIDEO_FORMAT_MASK_H265 as i32) != 0 { "hevc" } else { "h264" }
+}
 
 // ---- DECODER_RENDERER_CALLBACKS ----
 
 extern "C" fn dr_setup(
-    _video_format: c_int,
+    video_format: c_int,
     _width: c_int,
     _height: c_int,
     _redraw_rate: c_int,
     _context: *mut c_void,
     _dr_flags: c_int,
 ) -> c_int {
-    // 디코드는 프론트(WebCodecs)가 한다. 여기선 설정만 확인.
-    tracing::info!("decoder setup ok (passthrough → WebCodecs)");
+    // 디코드는 프론트(WebCodecs)가 한다. 협상된 video_format 을 기록해 프론트가 코덱을 맞추게 한다.
+    *NEGOTIATED_VIDEO_FORMAT.lock() = video_format;
+    tracing::info!(video_format, codec = negotiated_codec(), "decoder setup ok (passthrough → WebCodecs)");
     0
 }
 
@@ -165,7 +174,9 @@ pub fn start_stream(
         cfg.packetSize = 1392;
         cfg.streamingRemotely = STREAM_CFG_LOCAL as c_int;
         cfg.audioConfiguration = make_stereo_audio_config();
-        cfg.supportedVideoFormats = VIDEO_FORMAT_H264 as c_int;
+        // H.264 + HEVC 둘 다 지원 요청. 서버(streamhost)가 HEVC 가능하면 HEVC로 협상되고,
+        // 실제 협상된 포맷은 dr_setup(video_format)으로 확인해 프론트에 전달한다.
+        cfg.supportedVideoFormats = (VIDEO_FORMAT_H264 | VIDEO_FORMAT_H265) as c_int;
         cfg.encryptionFlags = 0;
         cfg.remoteInputAesKey = std::mem::transmute::<[u8; 16], [c_char; 16]>(launch.rikey);
         cfg.remoteInputAesIv = std::mem::transmute::<[u8; 16], [c_char; 16]>(launch.rikey_iv);

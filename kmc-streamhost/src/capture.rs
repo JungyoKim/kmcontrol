@@ -31,6 +31,8 @@ pub struct CaptureFlags {
     pub height: u32,
     pub fps: u32,
     pub bitrate_bps: u32,
+    /// QSV 인코더 이름: "h264_qsv" 또는 "hevc_qsv".
+    pub codec: &'static str,
     pub sender: crate::video::FrameSender,
     pub stop_rx: Arc<AtomicBool>,
     pub idr_req: Arc<AtomicBool>,
@@ -232,7 +234,7 @@ pub fn spawn_capture(flags: CaptureFlags) {
 
 /// 고정 fps 인코딩 루프. 슬롯의 최신 NV12(없으면 직전)를 협상 fps로 인코딩·전송.
 fn encode_loop(flags: CaptureFlags, slot: FrameSlot) {
-    let mut encoder = match QsvEncoder::new(flags.width, flags.height, flags.fps, flags.bitrate_bps) {
+    let mut encoder = match QsvEncoder::new_codec(flags.codec, flags.width, flags.height, flags.fps, flags.bitrate_bps) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error=%e, "qsv encoder init failed");

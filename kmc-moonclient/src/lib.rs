@@ -8,7 +8,7 @@ pub mod crypto;
 pub mod pair;
 
 pub use conn::{
-    request_idr, send_key, send_mouse_button, send_mouse_position, send_scroll, start_stream,
-    AuFrame, StreamSession,
+    negotiated_codec, request_idr, send_key, send_mouse_button, send_mouse_position, send_scroll,
+    start_stream, AuFrame, StreamSession,
 };
 pub use pair::{Identity, LaunchResult, PairedHost, ServerInfo};

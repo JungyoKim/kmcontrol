@@ -270,6 +270,12 @@ fn stream_audio_port(stream: State<'_, SharedStream>) -> Option<u16> {
     stream.audio_port()
 }
 
+/// 협상된 비디오 코덱("h264" 또는 "hevc"). 프론트가 WebCodecs 설정 전에 조회한다.
+#[tauri::command]
+fn stream_codec() -> String {
+    kmc_moonclient::negotiated_codec().to_string()
+}
+
 /// 원격 입력 — 절대 마우스 위치(참조 해상도 w×h 기준).
 #[tauri::command]
 fn stream_mouse_move(x: i32, y: i32, w: i32, h: i32) {
@@ -316,7 +322,8 @@ pub fn run() {
             stream_mouse_button,
             stream_key,
             stream_scroll,
-            stream_audio_port
+            stream_audio_port,
+            stream_codec
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

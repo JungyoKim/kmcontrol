@@ -470,6 +470,7 @@ function StreamView({
       }
       const port = (await invoke("stream_port")) as number | null;
       if (!port || !alive) return;
+      const streamCodec = ((await invoke("stream_codec")) as string) || "h264";
       decoder = new VideoDecoder({
         output: draw,
         error: (e) => console.error("VideoDecoder error", e),
@@ -483,7 +484,11 @@ function StreamView({
         const data = bytes.subarray(1);
         if (!configured) {
           if (!key) return; // 첫 키프레임 전의 델타는 버린다(디코더 동기).
-          const codec = codecFromSps(data) ?? "avc1.42E01F";
+          // HEVC 면 Main 프로파일 코덱 문자열(레벨 5.1=4K 커버), H.264 면 SPS 파싱값.
+          const codec =
+            streamCodec === "hevc"
+              ? "hvc1.1.6.L153.B0"
+              : (codecFromSps(data) ?? "avc1.42E01F");
           try {
             decoder.configure({
               codec,
