@@ -60,6 +60,9 @@ if (-not (Test-Path $cua)) {
 }
 
 # ---- 3. Tailscale (authkey 제공 + 관리자) ----
+# Windows 는 tailscaled 가 시스템 서비스라 --operator 불필요(Linux 전용). 관리자 컨텍스트에서
+# 직접 `tailscale up --auth-key ... --unattended` 로 등록한다(agent ensure_up 에 안 맡김 —
+# 비관리자 agent 가 up 하면 로그인 GUI 가 떠서 실패).
 $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 if ($AuthKey) {
@@ -71,14 +74,18 @@ if ($AuthKey) {
       Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
       Remove-Item $msi -ErrorAction SilentlyContinue
     } else {
-      Warn 'Tailscale 미설치 + 비관리자 → 설치 건너뜀. 관리자 PowerShell 에서 재실행하거나 Tailscale 을 별도 설치하세요. (agent 는 그동안 LAN 으로 동작)'
+      Warn 'Tailscale 미설치 + 비관리자 → 설치 건너뜀. 관리자 PowerShell 로 재실행하세요. (agent 는 그동안 LAN 동작)'
     }
   }
-  # operator 지정: 학생(현재 사용자)이 비관리자로 tailscale up/status 가능하게. 관리자 1회 필요.
   if ((Test-Path $tsExe) -and $isAdmin) {
-    $me = "$env:USERDOMAIN\$env:USERNAME"
-    Info "tailscale operator=$me"
-    & $tsExe set --operator=$me 2>&1 | Out-Null
+    # MSI 직후 tailscaled 서비스가 뜰 시간을 준다(최대 ~20s).
+    for ($i = 0; $i -lt 20; $i++) {
+      try { & $tsExe status --json 2>$null | Out-Null; break } catch { Start-Sleep 1 }
+    }
+    Info 'tailscale up (authkey, tag:camp-laptop, unattended)'
+    # 인자를 배열로 넘겨 PowerShell 의 -- 파싱 문제를 피한다.
+    $up = @('up', "--auth-key=$AuthKey", '--advertise-tags=tag:camp-laptop', "--hostname=$env:COMPUTERNAME", '--unattended')
+    & $tsExe @up 2>&1 | ForEach-Object { Info "ts: $_" }
   }
 }
 
