@@ -205,12 +205,21 @@ pub fn spawn_capture(flags: CaptureFlags) {
                                 }
                             };
                             let stop_rx = flags.stop_rx.clone();
+                            // WGC 의 MinUpdateInterval Default 는 사실상 60Hz(≈16.6ms)로 프레임 전달을
+                            // 캡한다. target fps 간격으로 낮춰(예 120fps→8.3ms) 캡처가 그 상한까지 프레임을
+                            // 공급하게 한다. 이 속성 미지원 플랫폼이면 Default 로 폴백(에러 방지).
+                            let target_fps = flags.fps.max(1);
+                            let min_interval = std::time::Duration::from_secs_f64(1.0 / target_fps as f64);
+                            let mui = match windows_capture::graphics_capture_api::GraphicsCaptureApi::is_minimum_update_interval_supported() {
+                                Ok(true) => MinimumUpdateIntervalSettings::Custom(min_interval),
+                                _ => MinimumUpdateIntervalSettings::Default,
+                            };
                             let settings = Settings::new(
                                 monitor,
                                 CursorCaptureSettings::WithCursor,
                                 DrawBorderSettings::Default,
                                 SecondaryWindowSettings::Default,
-                                MinimumUpdateIntervalSettings::Default,
+                                mui,
                                 DirtyRegionSettings::Default,
                                 ColorFormat::Bgra8,
                                 (flags, slot),
