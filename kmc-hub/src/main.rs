@@ -80,6 +80,7 @@ async fn serve() -> Result<()> {
 
     let app = Router::new()
         .route("/provision", post(routes::provision))
+        .route("/enroll/{secret}", get(routes::enroll))
         .route("/auth/login", post(routes::login))
         .route("/agents", get(routes::list_agents))
         .route("/session/request", post(routes::session_request))

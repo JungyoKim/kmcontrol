@@ -63,6 +63,35 @@ pub async fn provision(
     }
 }
 
+// GET /enroll/{secret} — 인증 대신 고정 시크릿 게이트(무입력 부트스트랩용).
+// 시크릿이 맞으면 authkey + hub URL 이 주입된 install 원라이너(PowerShell)를 text 로 반환한다.
+// 노트북(관리자 PS)에서: irm https://<hub-funnel>/enroll/<secret> | iex
+// env 로 구성: KMC_ENROLL_SECRET(필수), KMC_ENROLL_AUTHKEY(주입할 재사용 authkey),
+//             KMC_ENROLL_HUB_URL(agent 가 붙을 hub 주소, 보통 tailnet 100.x), KMC_RELEASE_URL, KMC_INSTALL_URL.
+pub async fn enroll(Path(secret): Path<String>) -> Response {
+    let expected = std::env::var("KMC_ENROLL_SECRET").unwrap_or_default();
+    if expected.is_empty() || secret != expected {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    let authkey = std::env::var("KMC_ENROLL_AUTHKEY").unwrap_or_default();
+    let hub_url = std::env::var("KMC_ENROLL_HUB_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let release_url = std::env::var("KMC_RELEASE_URL").unwrap_or_else(|_| {
+        "https://github.com/JungyoKim/kmcontrol/releases/latest/download/kmc-agent-bundle.zip".to_string()
+    });
+    let install_url = std::env::var("KMC_INSTALL_URL").unwrap_or_else(|_| {
+        "https://raw.githubusercontent.com/JungyoKim/kmcontrol/main/deploy/install.ps1".to_string()
+    });
+    // install.ps1 을 그대로 실행하되, hub/authkey/release 를 env 로 주입해 무입력 설치.
+    let script = format!(
+        "$env:KMC_HUB_URL='{hub_url}'\n\
+         $env:KMC_TS_AUTHKEY='{authkey}'\n\
+         $env:KMC_RELEASE_URL='{release_url}'\n\
+         irm '{install_url}' | iex\n"
+    );
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], script).into_response()
+}
+
 // POST /auth/login
 pub async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> Response {
     let verified = {
