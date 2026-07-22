@@ -747,7 +747,7 @@ function StreamView({
             <canvas
               ref={canvasRef}
               tabIndex={0}
-              className="block max-h-[75vh] max-w-full cursor-crosshair object-contain outline-none"
+              className="block max-h-[75vh] w-auto min-h-0 min-w-0 max-w-full cursor-crosshair object-contain outline-none"
             />
           ) : (
             <div className="flex h-64 w-full items-center justify-center text-sm text-muted-foreground">
