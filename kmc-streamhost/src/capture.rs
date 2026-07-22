@@ -105,6 +105,13 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         if self.converter.is_none() {
             let device: ID3D11Device = frame.device().clone();
             let context: ID3D11DeviceContext = frame.device_context().clone();
+            tracing::info!(
+                frame_w = frame.width(),
+                frame_h = frame.height(),
+                target_w = self.flags.width,
+                target_h = self.flags.height,
+                "capture frame dims vs encoder target"
+            );
             let conv = GpuConverter::new(device, context, frame.width(), frame.height(), self.flags.width, self.flags.height)
                 .map_err(|e| format!("gpu converter init: {e}"))?;
             self.converter = Some(conv);
@@ -260,7 +267,6 @@ fn encode_loop(flags: CaptureFlags, slot: FrameSlot) {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-
     loop {
         if flags.stop_rx.load(Ordering::Relaxed) {
             tracing::info!("encode loop stopping");

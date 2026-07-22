@@ -169,7 +169,8 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
                     let bitrate_floor = ((px_rate as f64 * 0.10) as u64).min(60_000_000) as u32;
                     let negotiated = if ctx.bitrate_bps == 0 { 15_000_000 } else { ctx.bitrate_bps };
                     let bitrate = negotiated.max(bitrate_floor);
-                    // 협상된 코덱: video_format 1=HEVC, 0=H264. HEVC 는 동일 대역폭 더 선명.
+                    // 협상된 코덱: video_format 1=HEVC, 0=H264. 클라(admin)가 H.264 만 요청하므로
+                    // 정상 경로에선 항상 0→h264_qsv. (hevc_qsv 는 이 GPU 에서 SPS crop 버그 → 클라가 HEVC 요청 안 함.)
                     let codec = if ctx.video_format == 1 { "hevc_qsv" } else { "h264_qsv" };
                     tracing::info!(w, h, fps, negotiated, bitrate_floor, bitrate, codec, "stream encoder selected");
                     // 지속 파이프라인: stop_rx는 절대 set되지 않음(프로세스 종료 시까지 유지).

@@ -440,9 +440,9 @@ function StreamView({
     try {
       const addr = await acquire();
       setStatus("연결 중...");
-      // 클라이언트(WebCodecs)가 HEVC 를 디코드할 수 있을 때만 HEVC 협상을 허용한다.
-      // 불가하면 H.264 만 요청해 안전 폴백(디코드 실패로 검은 화면 방지).
-      const allowHevc = await hevcSupported();
+      // H.264 고정: hevc_qsv 가 이 GPU 에서 SPS crop 버그(화면 좌상단만 표시)라 HEVC 비활성.
+      // 클라가 H.264 만 요청해야 dr_setup video_format=0 → H.264 디코더로 정상 표시.
+      const allowHevc = false;
       await invoke("start_stream", {
         address: addr,
         width: 1920,
@@ -484,9 +484,18 @@ function StreamView({
 
     const draw = (frame: VideoFrame) => {
       if (canvas && ctx) {
-        if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
-        if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
-        ctx.drawImage(frame as unknown as CanvasImageSource, 0, 0);
+        // codedWidth/Height = 실제 인코딩 해상도(예 2880×1800). displayWidth/visibleRect 는
+        // 일부 인코더(hevc_qsv)가 SPS conformance window 를 잘못 써 1280×720 등으로 축소 보고할 수 있어
+        // 화면이 좌상단만 잘려 나온다. 전체 코딩 프레임을 그려 크롭을 방지한다.
+        const cw = frame.codedWidth || frame.displayWidth;
+        const ch = frame.codedHeight || frame.displayHeight;
+        if (canvas.width !== cw) canvas.width = cw;
+        if (canvas.height !== ch) canvas.height = ch;
+        ctx.drawImage(
+          frame as unknown as CanvasImageSource,
+          0, 0, cw, ch,
+          0, 0, cw, ch,
+        );
       }
       frame.close();
     };

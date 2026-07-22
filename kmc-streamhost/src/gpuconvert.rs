@@ -77,6 +77,19 @@ impl GpuConverter {
                 &D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0 },
             );
 
+            // 명시적 소스/대상 사각형 — 일부 드라이버(Intel)는 지정 안 하면 대상 rect 를
+            // 입력 크기로 잡아 출력 좌상단에 1:1 배치(스케일 안 함)해 나머지가 검게 남는다.
+            // 소스=입력 전체, 대상=출력 전체로 지정해 반드시 스케일-투-필 하게 만든다.
+            let src_rect = windows::Win32::Foundation::RECT {
+                left: 0, top: 0, right: src_w as i32, bottom: src_h as i32,
+            };
+            let dst_rect = windows::Win32::Foundation::RECT {
+                left: 0, top: 0, right: tw as i32, bottom: th as i32,
+            };
+            video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&src_rect));
+            video_context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&dst_rect));
+            video_context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&dst_rect));
+
             // 출력 NV12 텍스처 (GPU, VideoProcessor 출력 대상).
             let nv12_desc = D3D11_TEXTURE2D_DESC {
                 Width: tw,

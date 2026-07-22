@@ -186,10 +186,9 @@ impl Webserver {
         let _ = (params, https);
         let local_ip = local.map(|a| a.ip().to_string()).unwrap_or_default();
 
-        // H.264 + HEVC(Main) 광고. Moonlight 클라가 HEVC 가능하면 HEVC 로 협상하고,
-        // 그 경우 streamhost 가 hevc_qsv 로 인코딩한다(video_format=1). 클라가 H.264 만 되면 H.264.
-        // ServerCodecModeSupport: bit0=H264, bit1=HEVC Main → 0x0003.
-        let codec_support: u32 = 0x0003;
+        // H.264 전용 광고. hevc_qsv 가 이 GPU 에서 SPS crop 버그(좌상단만 표시)라 HEVC 비활성.
+        // ServerCodecModeSupport: bit0=H264 → 0x0001.
+        let codec_support: u32 = 0x0001;
 
         let mut xml = String::from("<root status_code=\"200\">");
         xml += &format!("<hostname>{}</hostname>", escape_xml(&self.config.name));
@@ -199,7 +198,7 @@ impl Webserver {
         xml += &format!("<HttpsPort>{}</HttpsPort>", self.config.https_port);
         xml += &format!("<ExternalPort>{}</ExternalPort>", self.config.http_port);
         xml += "<mac>00:00:00:00:00:00</mac>";
-        xml += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // HEVC 지원(≥4K 허용 값)
+        xml += "<MaxLumaPixelsHEVC>0</MaxLumaPixelsHEVC>"; // HEVC 비활성(0=미지원)
         xml += &format!("<LocalIP>{}</LocalIP>", escape_xml(&local_ip));
         xml += &format!("<ServerCodecModeSupport>{codec_support}</ServerCodecModeSupport>");
         xml += "<SupportedDisplayMode></SupportedDisplayMode>";
