@@ -231,6 +231,47 @@ impl GpuConverter {
             Ok(&self.nv12_buf)
         }
     }
+
+    /// 소스 BGRA 를 GPU 에서 NV12 로 변환·다운스케일만 하고, 결과 NV12 D3D11 텍스처(GPU)를 반환.
+    /// CPU 다운로드(Map/memcpy) 없음 — zero-copy 인코더가 이 텍스처를 CopySubresourceRegion 으로
+    /// ffmpeg hwframe 에 옮겨 QSV 에 직접 먹인다.
+    pub fn convert_gpu(&mut self, src: &ID3D11Texture2D) -> Result<&ID3D11Texture2D> {
+        unsafe {
+            let in_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 },
+                },
+            };
+            let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
+            self.video_device
+                .CreateVideoProcessorInputView(src, &self.enumerator, &in_view_desc, Some(&mut in_view))
+                .map_err(|e| anyhow!("create input view: {e}"))?;
+            let in_view = in_view.ok_or_else(|| anyhow!("input view null"))?;
+            let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+                Enable: true.into(),
+                OutputIndex: 0,
+                InputFrameOrField: 0,
+                PastFrames: 0,
+                FutureFrames: 0,
+                ppPastSurfaces: std::ptr::null_mut(),
+                pInputSurface: std::mem::ManuallyDrop::new(Some(in_view.clone())),
+                ppFutureSurfaces: std::ptr::null_mut(),
+                ppPastSurfacesRight: std::ptr::null_mut(),
+                pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
+                ppFutureSurfacesRight: std::ptr::null_mut(),
+            };
+            self.video_context
+                .VideoProcessorBlt(&self.processor, &self.out_view, 0, &[stream])
+                .map_err(|e| anyhow!("VideoProcessorBlt: {e}"))?;
+            Ok(&self.nv12_tex)
+        }
+    }
+
+    /// GPU 변환 출력 NV12 텍스처(공유용) + 디바이스 컨텍스트 접근.
+    pub fn nv12_texture(&self) -> &ID3D11Texture2D { &self.nv12_tex }
+    pub fn device_context(&self) -> &ID3D11DeviceContext { &self.context }
 }
 
 // GpuConverter는 캡처 스레드에서만 사용됨 (COM, 단일 스레드).
