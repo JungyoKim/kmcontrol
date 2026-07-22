@@ -163,7 +163,7 @@
 | 상태 보고 | agent `sysstat` (배터리/디스크/프로세스 WS push) | E2E |
 | PowerShell 명령 | agent `exec.rs` (`CommandKind::PowerShell`) | E2E (파일수정·즉석Python실행 실증) |
 | **스트리밍(자체구현)** | `kmc-streamhost`(GameStream 호스트), `kmc-moonclient`(클라), `kmc-admin`(Tauri) | 페어링 제거 후 WebCodecs GPU 디코드, 60fps E2E |
-| **코덱: H.264 + HEVC** | streamhost `qsv.rs` `hevc_qsv`(Main, 네이티브 해상도/비트레이트), `webserver.rs` HEVC 광고(codec_support 0x0003, MaxLumaPixelsHEVC≥4K), moonclient `conn.rs` H264\|H265 협상+협상포맷 관찰, 프론트 WebCodecs `hvc1.1.6.L153.B0` 디코드, 클라 HEVC 미지원 시 H.264 폴백(isConfigSupported 프로브) | **라이브 E2E 검증**(예제 `hevc_probe`): 노트북(Intel Arc 140V)에 tailnet 연결→`negotiated_codec=hevc`, 328프레임/6s, NAL VPS(32)/SPS(33)/PPS(34)/IDR(19)=실 HEVC Main 비트스트림. 프론트 디코드는 표준 코덱 문자열+폴백 |
+| **코덱: H.264 (HEVC 보류)** | streamhost `qsv.rs` `h264_qsv`(Main, veryfast, low_delay_brc, 네이티브 해상도+비트레이트 하한), `webserver.rs` H.264 단독 광고(codec_support 0x0001, MaxLumaPixelsHEVC=0), moonclient H.264 요청, 프론트 WebCodecs `avc1.*`(SPS 파싱) codedWidth 전체 그리기 | **라이브 E2E 검증**: 노트북(Intel Arc, 2880×1800 네이티브) admin 스트림 `codec=h264`, 캔버스 2880×1808, 전체 데스크톱 잘림 없이 표시(CDP 픽셀 샘플 전 영역 내용). **HEVC 보류**: hevc_qsv 가 이 GPU 에서 SPS conformance window 를 1280×720 으로 잘못 기록→디코더가 좌상단만 표시. H.264 는 정상 |
 | 오디오 | streamhost WASAPI 루프백→Opus→RTP, 프론트 WebCodecs AudioDecoder | E2E (100 Opus 프레임) |
 | 원격 입력 | control 0x0206→SendInput, 프론트 canvas 캡처 | E2E (커서 이동 실증) |
 | agent↔스트림 통합 | agent가 streamhost in-process 기동, hub가 peer IP→세션 주소 반환 | E2E |
