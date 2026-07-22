@@ -163,6 +163,7 @@
 | 상태 보고 | agent `sysstat` (배터리/디스크/프로세스 WS push) | E2E |
 | PowerShell 명령 | agent `exec.rs` (`CommandKind::PowerShell`) | E2E (파일수정·즉석Python실행 실증) |
 | **스트리밍(자체구현)** | `kmc-streamhost`(GameStream 호스트), `kmc-moonclient`(클라), `kmc-admin`(Tauri) | 페어링 제거 후 WebCodecs GPU 디코드, 60fps E2E |
+| **코덱: H.264 + HEVC** | streamhost `qsv.rs` `hevc_qsv`(Main, 네이티브 해상도/비트레이트), `webserver.rs` HEVC 광고(codec_support 0x0003, MaxLumaPixelsHEVC≥4K), moonclient `conn.rs` H264\|H265 협상 요청+협상포맷 관찰, 프론트 WebCodecs `hvc1.1.6.L153.B0` 디코드 | 인코더 런타임 검증(2880×1800 31Mbps HEVC Main). 클라가 HEVC 디코드 불가 시 H.264 폴백(WebCodecs isConfigSupported 프로브). 협상→디코드 라이브 E2E는 노트북 온라인 시 |
 | 오디오 | streamhost WASAPI 루프백→Opus→RTP, 프론트 WebCodecs AudioDecoder | E2E (100 Opus 프레임) |
 | 원격 입력 | control 0x0206→SendInput, 프론트 canvas 캡처 | E2E (커서 이동 실증) |
 | agent↔스트림 통합 | agent가 streamhost in-process 기동, hub가 peer IP→세션 주소 반환 | E2E |
