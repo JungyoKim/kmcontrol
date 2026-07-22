@@ -149,10 +149,27 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
                 if dummy_video {
                     crate::video::spawn_dummy_generator(sender, ctx.fps.max(1));
                 } else {
-                    // 협상값을 그대로 존중해 캡처/인코더를 고정 생성.
-                    let (w, h) = (ctx.width.max(2) & !1, ctx.height.max(2) & !1);
+                    // 네이티브 해상도 캡처: primary 모니터 실제 크기를 사용(협상값 무시).
+                    // 조회 실패 시에만 협상값으로 폴백. 종횡비 왜곡 방지.
+                    let (w, h) = match windows_capture::monitor::Monitor::primary() {
+                        Ok(m) => match (m.width(), m.height()) {
+                            (Ok(mw), Ok(mh)) => {
+                                tracing::info!(mw, mh, "capturing at native monitor resolution");
+                                (mw.max(2) & !1, mh.max(2) & !1)
+                            }
+                            _ => (ctx.width.max(2) & !1, ctx.height.max(2) & !1),
+                        },
+                        Err(_) => (ctx.width.max(2) & !1, ctx.height.max(2) & !1),
+                    };
                     let fps = ctx.fps.max(1);
-                    let bitrate = if ctx.bitrate_bps == 0 { 15_000_000 } else { ctx.bitrate_bps };
+                    // 네이티브 해상도는 픽셀이 많아 협상 비트레이트론 뭉개진다.
+                    // 해상도·fps 기반 하한(≈ w*h*fps*0.10 bpp, bits/pixel/frame)을 적용해
+                    // 협상값과 그 하한 중 큰 쪽을 쓴다. 상한 60Mbps(과도 대역폭 방지).
+                    let px_rate = (w as u64) * (h as u64) * (fps as u64);
+                    let bitrate_floor = ((px_rate as f64 * 0.10) as u64).min(60_000_000) as u32;
+                    let negotiated = if ctx.bitrate_bps == 0 { 15_000_000 } else { ctx.bitrate_bps };
+                    let bitrate = negotiated.max(bitrate_floor);
+                    tracing::info!(w, h, fps, negotiated, bitrate_floor, bitrate, "bitrate selected");
                     // 지속 파이프라인: stop_rx는 절대 set되지 않음(프로세스 종료 시까지 유지).
                     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

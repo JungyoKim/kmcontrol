@@ -709,15 +709,15 @@ function StreamView({
           )}
         </div>
         {status && <p className="text-sm text-muted-foreground">{status}</p>}
-        <div className="overflow-hidden rounded border border-border bg-black">
+        <div className="flex justify-center overflow-hidden rounded border border-border bg-black">
           {streaming ? (
             <canvas
               ref={canvasRef}
               tabIndex={0}
-              className="w-full cursor-crosshair outline-none"
+              className="block max-h-[75vh] max-w-full cursor-crosshair object-contain outline-none"
             />
           ) : (
-            <div className="flex h-64 items-center justify-center text-sm text-muted-foreground">
+            <div className="flex h-64 w-full items-center justify-center text-sm text-muted-foreground">
               연결하면 화면이 표시됩니다
             </div>
           )}
