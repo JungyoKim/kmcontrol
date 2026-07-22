@@ -686,6 +686,18 @@ function StreamView({
     let decoder: AudioDecoder | null = null;
     let ac: AudioContext | null = null;
     let playHead = 0; // 다음 버퍼를 넣을 AudioContext 시각(초).
+    let gain: GainNode | null = null;
+    let lastFade = 0; // 마지막 볼륨 램프 시각(초) — 리싱크 시 잦은 램프 방지.
+    // 볼륨 램프: from→1 로 dur초. 초기/리싱크 글리치를 볼륨으로 감춘다(사용자 요청).
+    const fadeUp = (from: number, dur: number, force = false) => {
+      if (!ac || !gain) return;
+      const t = ac.currentTime;
+      if (!force && t - lastFade < 0.3) return;
+      lastFade = t;
+      gain.gain.cancelScheduledValues(t);
+      gain.gain.setValueAtTime(Math.max(0.0001, from), t);
+      gain.gain.linearRampToValueAtTime(1, t + dur);
+    };
 
     const play = (ad: AudioData) => {
       if (!alive || !ac) {
@@ -702,19 +714,19 @@ function StreamView({
       }
       ad.close();
       const now = ac.currentTime;
-      const TARGET = 0.02; // 목표 지터 버퍼 20ms(저지연).
-      const MAX = 0.1; // 상한 100ms.
+      const TARGET = 0.01; // 목표 지터 버퍼 10ms — 최대한 타이트한 싱크.
+      const MAX = 0.05; // 상한 50ms — 초과 시 드롭해 빠르게 지연 회수.
       if (playHead < now) {
-        // 언더런: 뒤처짐 → 목표 리드로 리싱크.
+        // 언더런(불연속) → 목표 리드로 리싱크 + 볼륨 살짝 죽였다 램프로 클릭 완화.
         playHead = now + TARGET;
+        fadeUp(0.25, 0.1);
       } else if (playHead - now > MAX) {
-        // 너무 앞섬(초기 버스트/클럭 드리프트) → 이 5ms 프레임 드롭. playHead 유지, now 진행 →
-        // 리드가 실시간으로 줄어 지연을 회수한다(영구 지연 방지 = Sunshine 지터버퍼 상한과 동일 취지).
+        // 너무 앞섬(초기 버스트/드리프트) → 이 5ms 프레임 드롭 → 리드가 실시간으로 줄어 회수.
         return;
       }
       const src = ac.createBufferSource();
       src.buffer = buf;
-      src.connect(ac.destination);
+      src.connect(gain ?? ac.destination);
       src.start(playHead);
       playHead += buf.duration;
     };
@@ -729,6 +741,12 @@ function StreamView({
       } catch {
         /* 사용자 제스처(연결 클릭)로 이미 허용됨 */
       }
+      gain = ac.createGain();
+      gain.connect(ac.destination);
+      // 초기: 무음에서 0.5s 동안 서서히 키움 — 초기 버스트/드롭 글리치를 감춘다.
+      gain.gain.setValueAtTime(0, ac.currentTime);
+      gain.gain.linearRampToValueAtTime(1, ac.currentTime + 0.5);
+      lastFade = ac.currentTime;
       decoder = new AudioDecoder({ output: play, error: (e) => console.error("AudioDecoder", e) });
       // Opus 48kHz 스테레오. Moonlight/Sunshine은 raw Opus 패킷을 보낸다.
       decoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 2 });
