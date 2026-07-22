@@ -18,13 +18,32 @@ pub async fn run(state: AgentState) -> Result<()> {
     }
 
     let ws_url = ws_url(&config::hub_url());
+    let mut state = state;
     loop {
         match connect_once(&ws_url, &state).await {
             Ok(()) => tracing::warn!("ws connection closed; reconnecting in 5s"),
+            Err(e) if is_auth_failure(&e) => {
+                // hub DB 초기화(볼륨 교체/재배포 등)로 이 agent_id/token 이 hub 에 없어진 경우.
+                // stale state 를 버리고 재-provision 해서 새 정체성으로 재등록한다(자가치유).
+                tracing::warn!("hello auth rejected — dropping stale state and re-provisioning");
+                let _ = std::fs::remove_file(config::state_path());
+                match crate::provision::provision().await {
+                    Ok(fresh) if !fresh.provision_token.is_empty() => {
+                        tracing::info!(agent_id=%fresh.agent_id, name=%fresh.name, "re-provisioned after auth failure");
+                        state = fresh;
+                    }
+                    _ => tracing::warn!("re-provision failed; will retry"),
+                }
+            }
             Err(e) => tracing::warn!(error=%e, "ws connection error; reconnecting in 5s"),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Hello 인증 거부(hub 가 hello 중 연결 종료)를 식별한다.
+fn is_auth_failure(e: &anyhow::Error) -> bool {
+    e.to_string().contains("during hello")
 }
 
 fn ws_url(hub_url: &str) -> String {
