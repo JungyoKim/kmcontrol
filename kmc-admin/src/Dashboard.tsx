@@ -376,20 +376,6 @@ function codecFromSps(annexb: Uint8Array): string | null {
 // HEVC Main 프로파일, 레벨 5.1(=153, 4K 커버). streamhost hevc_qsv 출력(Main)과 일치.
 const HEVC_CODEC = "hvc1.1.6.L153.B0";
 
-// 이 WebView(WebCodecs)가 HEVC 를 하드웨어 디코드할 수 있는지 검사. 협상 전에 호출해
-// 불가하면 H.264 만 요청한다(검은 화면 폴백 방지).
-async function hevcSupported(): Promise<boolean> {
-  if (!("VideoDecoder" in window)) return false;
-  try {
-    const r = await VideoDecoder.isConfigSupported({
-      codec: HEVC_CODEC,
-      hardwareAcceleration: "prefer-hardware",
-    } as VideoDecoderConfig);
-    return !!r.supported;
-  } catch {
-    return false;
-  }
-}
 
 // JS KeyboardEvent.code → Windows Virtual-Key 코드(호스트가 그대로 SendInput에 사용).
 function vkFromCode(e: KeyboardEvent): number {
@@ -432,6 +418,14 @@ function StreamView({
 }) {
   const [streaming, setStreaming] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  // 화질 프리셋 = 최대 "박스" 크기(긴 변 기준). agent 가 네이티브 화면비를 이 박스에 맞춰
+  // 비율 유지로 축소(왜곡·업스케일 없음). "원본"은 박스 무제한(agent 네이티브 그대로).
+  const QUALITY: Record<string, { w: number; h: number; label: string }> = {
+    native: { w: 0, h: 0, label: "원본 (네이티브)" },
+    high: { w: 2560, h: 2560, label: "고화질 (~2560)" },
+    standard: { w: 1600, h: 1600, label: "표준 (~1600)" },
+  };
+  const [quality, setQuality] = useState<keyof typeof QUALITY>("high");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // 연결: 세션 요청(주소 획득) → 그 호스트로 스트림 시작. 노트북 선택 후 버튼 하나로 완결.
@@ -441,13 +435,14 @@ function StreamView({
       const addr = await acquire();
       setStatus("연결 중...");
       // H.264 고정: hevc_qsv 가 이 GPU 에서 SPS crop 버그(화면 좌상단만 표시)라 HEVC 비활성.
-      // 클라가 H.264 만 요청해야 dr_setup video_format=0 → H.264 디코더로 정상 표시.
       const allowHevc = false;
+      const q = QUALITY[quality];
+      // fps=0 = 무제한(agent 인코더 상한까지). width/height = 최대 박스(agent 가 네이티브 AR 유지 축소).
       await invoke("start_stream", {
         address: addr,
-        width: 1920,
-        height: 1080,
-        fps: 60,
+        width: q.w,
+        height: q.h,
+        fps: 0,
         pin: null,
         allowHevc,
       });
@@ -741,9 +736,25 @@ function StreamView({
       <CardContent className="space-y-3">
         <div className="flex items-end gap-2">
           {!streaming ? (
-            <Button onClick={start} disabled={!agent}>
-              연결
-            </Button>
+            <>
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-muted-foreground">화질</label>
+                <select
+                  value={quality}
+                  onChange={(e) => setQuality(e.target.value as keyof typeof QUALITY)}
+                  className="h-9 rounded-md border border-input bg-background px-2 text-sm"
+                >
+                  {Object.entries(QUALITY).map(([k, v]) => (
+                    <option key={k} value={k}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <Button onClick={start} disabled={!agent}>
+                연결
+              </Button>
+            </>
           ) : (
             <Button variant="outline" onClick={stop}>
               중지

@@ -149,28 +149,37 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
                 if dummy_video {
                     crate::video::spawn_dummy_generator(sender, ctx.fps.max(1));
                 } else {
-                    // 네이티브 해상도 캡처: primary 모니터 실제 크기를 사용(협상값 무시).
-                    // 조회 실패 시에만 협상값으로 폴백. 종횡비 왜곡 방지.
-                    let (w, h) = match windows_capture::monitor::Monitor::primary() {
+                    // 비율은 항상 agent 네이티브 화면을 따른다. admin 이 보낸 w/h 는 "최대 박스"로
+                    // 해석 — 네이티브를 그 박스 안에 비율 유지로 축소(업스케일·왜곡 금지). 박스가
+                    // 네이티브보다 크거나 0 이면 네이티브 그대로. 짝수 정렬.
+                    let (nw, nh) = match windows_capture::monitor::Monitor::primary() {
                         Ok(m) => match (m.width(), m.height()) {
-                            (Ok(mw), Ok(mh)) => {
-                                tracing::info!(mw, mh, "capturing at native monitor resolution");
-                                (mw.max(2) & !1, mh.max(2) & !1)
-                            }
-                            _ => (ctx.width.max(2) & !1, ctx.height.max(2) & !1),
+                            (Ok(mw), Ok(mh)) => (mw.max(2), mh.max(2)),
+                            _ => (ctx.width.max(2), ctx.height.max(2)),
                         },
-                        Err(_) => (ctx.width.max(2) & !1, ctx.height.max(2) & !1),
+                        Err(_) => (ctx.width.max(2), ctx.height.max(2)),
                     };
-                    let fps = ctx.fps.max(1);
-                    // 네이티브 해상도는 픽셀이 많아 협상 비트레이트론 뭉개진다.
-                    // 해상도·fps 기반 하한(≈ w*h*fps*0.10 bpp, bits/pixel/frame)을 적용해
-                    // 협상값과 그 하한 중 큰 쪽을 쓴다. 상한 60Mbps(과도 대역폭 방지).
+                    let (bw, bh) = (ctx.width, ctx.height);
+                    let (w, h) = if bw == 0 || bh == 0 || (bw >= nw && bh >= nh) {
+                        (nw, nh) // 박스 미지정/네이티브보다 큼 → 네이티브 그대로.
+                    } else {
+                        // 네이티브 AR 유지하며 박스에 맞춰 축소. scale = min(bw/nw, bh/nh).
+                        let s = (bw as f64 / nw as f64).min(bh as f64 / nh as f64);
+                        (((nw as f64 * s) as u32).max(2), ((nh as f64 * s) as u32).max(2))
+                    };
+                    let (w, h) = (w & !1, h & !1); // QSV 짝수 정렬.
+                    tracing::info!(nw, nh, box_w = bw, box_h = bh, out_w = w, out_h = h, "resolution: native AR fit to box");
+                    // fps = target 상한. admin 이 0(무제한)을 보내면 120 으로 캡(Sunshine 처럼
+                    // "무제한"은 상한 제거가 아니라 이벤트 구동으로 이 상한까지 뽑는 것). 인코더가
+                    // 그보다 느리면 자연히 낮아짐(2880×1800 은 ~55fps). 정적 화면은 min_fps 로 스로틀.
+                    let fps = if ctx.fps == 0 { 120 } else { ctx.fps };
+                    // 비트레이트 하한 = 해상도·fps 기반. 상한 60Mbps.
                     let px_rate = (w as u64) * (h as u64) * (fps as u64);
                     let bitrate_floor = ((px_rate as f64 * 0.10) as u64).min(60_000_000) as u32;
                     let negotiated = if ctx.bitrate_bps == 0 { 15_000_000 } else { ctx.bitrate_bps };
                     let bitrate = negotiated.max(bitrate_floor);
                     // 협상된 코덱: video_format 1=HEVC, 0=H264. 클라(admin)가 H.264 만 요청하므로
-                    // 정상 경로에선 항상 0→h264_qsv. (hevc_qsv 는 이 GPU 에서 SPS crop 버그 → 클라가 HEVC 요청 안 함.)
+                    // 정상 경로에선 항상 0→h264_qsv. (hevc_qsv 는 이 GPU 에서 SPS crop 버그.)
                     let codec = if ctx.video_format == 1 { "hevc_qsv" } else { "h264_qsv" };
                     tracing::info!(w, h, fps, negotiated, bitrate_floor, bitrate, codec, "stream encoder selected");
                     // 지속 파이프라인: stop_rx는 절대 set되지 않음(프로세스 종료 시까지 유지).
