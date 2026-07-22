@@ -9,6 +9,8 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 pub mod stream;
+#[cfg(windows)]
+pub mod kbhook;
 use stream::{SharedStream, StreamState};
 
 /// 로그인 세션(hub 접속 정보 + admin 토큰).
@@ -248,14 +250,21 @@ async fn start_stream(
 ) -> Result<(), String> {
     let allow_hevc = allow_hevc.unwrap_or(false);
     let st = stream.inner().clone();
-    tokio::task::spawn_blocking(move || st.start(&address, width, height, fps, pin, allow_hevc))
+    let r = tokio::task::spawn_blocking(move || st.start(&address, width, height, fps, pin, allow_hevc))
         .await
         .map_err(|e| format!("join: {e}"))?
-        .map_err(|e| format!("start_stream: {e}"))
+        .map_err(|e| format!("start_stream: {e}"));
+    #[cfg(windows)]
+    if r.is_ok() {
+        kbhook::set_streaming(true);
+    }
+    r
 }
 
 #[tauri::command]
 fn stop_stream(stream: State<'_, SharedStream>) {
+    #[cfg(windows)]
+    kbhook::set_streaming(false);
     stream.stop();
 }
 
@@ -310,6 +319,12 @@ pub fn run() {
         .setup(|app| {
             app.manage::<SharedBackend>(Arc::new(Backend::default()));
             app.manage::<SharedStream>(Arc::new(StreamState::default()));
+            #[cfg(windows)]
+            if let Some(win) = app.get_webview_window("main") {
+                if let Ok(hwnd) = win.hwnd() {
+                    kbhook::install(hwnd.0 as isize);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

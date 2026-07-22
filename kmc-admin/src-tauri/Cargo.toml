@@ -27,3 +27,10 @@ anyhow = "1"
 kmc-proto = { path = "../../kmc-proto" }
 kmc-moonclient = { path = "../../kmc-moonclient" }
 # 프레임 디코드는 프론트(WebCodecs)가 GPU로 수행 — Rust측 이미지/ffmpeg 인코딩 불필요.
+
+# 저수준 키보드 훅(윈도우키/한영키 등 시스템 키를 원격으로 그랩).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
