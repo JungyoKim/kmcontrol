@@ -1,0 +1,15 @@
+[package]
+name = "kmc-mooncommon"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Rust FFI bindings for moonlight-common-c (GameStream client protocol)"
+
+[lib]
+name = "kmc_mooncommon"
+
+[build-dependencies]
+cmake = "0.1"
+bindgen = "0.70"
+
+[dependencies]

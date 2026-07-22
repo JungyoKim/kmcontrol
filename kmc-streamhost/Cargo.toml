@@ -1,0 +1,101 @@
+[package]
+name = "kmc-streamhost"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "kmc_streamhost"
+path = "src/lib.rs"
+
+[[bin]]
+name = "streamhost-capture-test"
+path = "src/bin/capture_test.rs"
+
+[[bin]]
+name = "streamhost-host-test"
+path = "src/bin/host_test.rs"
+
+[[bin]]
+name = "streamhost-encoder-test"
+path = "src/bin/encoder_test.rs"
+
+[[bin]]
+name = "streamhost-qsv-test"
+path = "src/bin/qsv_test.rs"
+
+[[bin]]
+name = "streamhost-pipeline-bench"
+path = "src/bin/pipeline_bench.rs"
+
+[dependencies]
+windows-capture = "2.0.0"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+
+# async runtime + http
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+url = "2"
+
+# tls (ring backend: no aws-lc-rs / cmake / nasm)
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+
+# crypto (pure rust)
+rsa = { version = "0.9", features = ["sha2"] }
+aes = "0.8"
+aes-gcm = "0.10"
+cbc = { version = "0.1", features = ["alloc"] }
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+x509-parser = "0.16"
+
+# rtsp
+rtsp-types = "0.1"
+sdp-types = "0.1"
+
+# control channel (ENet, pure-rust)
+tokio-enet = "0.1"
+
+# Reed-Solomon FEC (Moonlight video parity shards)
+fec-rs = "0.1"
+
+
+# CPU parallelism for color conversion
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# FFmpeg h264_qsv hardware encoder (GPU zero-copy path)
+ffmpeg-next = "=7.1.0"
+
+# UDP send-buffer tuning (avoid keyframe burst loss)
+socket2 = "0.5"
+
+# 데스크톱 오디오 루프백 캡처(WASAPI) + Opus 인코딩
+wasapi = "0.23"
+audiopus = "0.2"
+
+# Media Foundation hardware encoder (MFT) + D3D11
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_UI_Input_KeyboardAndMouse",
+]
+
+[dev-dependencies]
+# for crypto round-trip tests emulating the client side

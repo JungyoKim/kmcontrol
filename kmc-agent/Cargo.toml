@@ -1,0 +1,29 @@
+[package]
+name = "kmc-agent"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "kmc-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sysinfo = "0.32"
+battery = "0.7"
+mac_address = "1"
+rand = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+kmc-proto = { path = "../kmc-proto" }
+# 자체 GameStream 호스트(Sunshine 대체) — agent가 in-process로 기동. Windows 전용.
+kmc-streamhost = { path = "../kmc-streamhost" }

@@ -1,0 +1,6 @@
+# ffmpeg-sys-next 빌드에 필요한 환경변수.
+# FFMPEG_DIR: 시스템 ffmpeg shared 빌드(include/ + lib/).
+# LIBCLANG_PATH: bindgen이 쓰는 libclang.dll (pip libclang 휠 제공).
+[env]
+FFMPEG_DIR = "C:\\Users\\G433m\\ffmpeg-7.1-shared"
+LIBCLANG_PATH = "C:\\Users\\G433m\\.pyenv\\pyenv-win\\versions\\3.13.7\\Lib\\site-packages\\clang\\native"

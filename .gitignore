@@ -1,0 +1,32 @@
+# Rust build artifacts (per-project target dirs)
+target/
+**/*.rs.bk
+
+# Hub runtime state
+hub.db
+hub.db-journal
+hub.db-wal
+hub.db-shm
+
+# Agent runtime state
+agent-state.json
+
+# Node / Vite
+kmc-admin/node_modules
+kmc-admin/dist
+
+# Tauri generated
+kmc-admin/src-tauri/gen
+
+# Streamhost captures / scratch
+*.h264
+*.mp4
+
+# Secrets / local certs / keys (never commit)
+*.pem
+provision.env
+.omp/
+
+# Deploy build artifacts
+deploy/kmc-agent-bundle.zip
+*.old*.exe

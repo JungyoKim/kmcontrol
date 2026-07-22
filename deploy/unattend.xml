@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  kmc-agent WTG(Windows To Go) 무인 프로비저닝 응답 파일.
+
+  사양서 §WTG "unattend.xml" 요구 충족:
+    - OOBE(EULA / 지역·키보드 / 계정 생성 화면) 전체 스킵
+    - specialize 패스에 provision.ps1 실행 등록
+
+  패턴 출처(MIT): cschneegans/unattend-generator, memstechtips/UnattendedWinstall.
+  프로비저닝 스크립트는 이미지의 C:\kmc\provision.ps1 에 배치되어 있어야 한다.
+
+  주의: 이 파일은 admin 비밀번호를 평문으로 담지 않는다(로컬 계정은 provision.ps1이 생성).
+  빌드 시 authkey 등 비밀은 provision.ps1 인자/환경으로 주입하고 하드코딩하지 않는다.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <!-- ===== windowsPE: (선택) Win11 하드웨어 체크 우회 — 임의 하드웨어 WTG 롤아웃용 ===== -->
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral"
+               versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <!-- ===== specialize: provision.ps1 실행 (SYSTEM 권한, 로그온 전) ===== -->
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral"
+               versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>kmc provision</Description>
+          <!-- provision.ps1: Tailscale 설치+up, /provision 호출, 로컬 자동로그인 계정 생성 -->
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\kmc\provision.ps1</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <!-- ===== oobeSystem: OOBE 화면 전체 숨김 ===== -->
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral"
+               versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+      <!-- 첫 로그온 후 웰컴/OneDrive/Edge 첫실행 억제는 provision.ps1이 레지스트리로 처리 -->
+    </component>
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral"
+               versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <InputLocale>0412:00000412</InputLocale>
+      <SystemLocale>ko-KR</SystemLocale>
+      <UILanguage>ko-KR</UILanguage>
+      <UserLocale>ko-KR</UserLocale>
+    </component>
+  </settings>
+
+</unattend>

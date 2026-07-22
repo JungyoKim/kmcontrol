@@ -1,0 +1,49 @@
+// kmc 노트북 관리 시스템 — Tailscale ACL 정책 (HuJSON).
+//
+// Tailscale 관리 콘솔(Access Controls)에 붙여넣어 적용한다.
+// 태그 3종:
+//   tag:hub         — 중앙 hub-server 노드
+//   tag:admin       — 관리자 클라이언트(kmc-admin) 노드
+//   tag:camp-laptop — 관리 대상 노트북(kmc-agent + streamhost) 노드
+//
+// 규칙은 "누가 먼저 연결하는가(dial)"의 실제 방향에 맞춘다:
+//   - agent 는 hub 로 WS 를 맺는다(제어플레인, 명령은 이 연결로 흐름)  → camp-laptop → hub
+//   - admin 은 hub 로 REST/WS 를 맺는다(목록/세션/명령 중계)         → admin → hub
+//   - admin 은 노트북의 자체 GameStream 호스트로 직접 P2P 연결한다   → admin → camp-laptop
+//   - 노트북끼리는 서로 접근 불가(기본 거부로 자동 충족)
+{
+  "tagOwners": {
+    "tag:hub":         ["autogroup:admin"],
+    "tag:admin":       ["autogroup:admin"],
+    "tag:camp-laptop": ["autogroup:admin"],
+  },
+
+  "acls": [
+    // 노트북 → hub : agent 제어플레인 WS + /provision (hub HTTP/WS 포트).
+    { "action": "accept", "src": ["tag:camp-laptop"], "dst": ["tag:hub:8080"] },
+
+    // 관리자 → hub : 관리 REST/WS.
+    { "action": "accept", "src": ["tag:admin"], "dst": ["tag:hub:8080"] },
+
+    // 관리자 → 노트북 : 스트리밍/수동 제어(자체 GameStream 호스트 포트들).
+    {
+      "action": "accept",
+      "src": ["tag:admin"],
+      "dst": [
+        "tag:camp-laptop:47984", // HTTPS serverinfo
+        "tag:camp-laptop:47989", // HTTP serverinfo
+        "tag:camp-laptop:48010", // RTSP
+        "tag:camp-laptop:47999", // 제어 채널 (ENet/UDP)
+        "tag:camp-laptop:47998", // 영상 (UDP)
+        "tag:camp-laptop:48000", // 오디오 (UDP)
+      ],
+    },
+
+    // 참고: 명령/상태는 hub→노트북 dial 이 아니라 노트북→hub WS 로 흐르므로
+    //       hub → camp-laptop 허용 규칙은 불필요하다.
+    // camp-laptop ↔ camp-laptop 은 미기재 = 기본 거부(피어 간 격리).
+  ],
+
+  // 태그 노드에 SSH 접근이 필요하면 아래 ssh 블록을 확장한다(현재 미사용).
+  // "ssh": [],
+}

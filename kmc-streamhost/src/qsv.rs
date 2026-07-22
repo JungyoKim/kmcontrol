@@ -1,0 +1,116 @@
+//! FFmpeg h264_qsv 하드웨어 인코더 래퍼 (Intel QuickSync).
+//!
+//! NV12 프레임 입력 → Annex-B H.264 패킷 출력. 저지연 설정(무한 GOP + 온디맨드 IDR,
+//! B프레임 없음, low_delay_brc). Sunshine의 quicksync encoder_t 설정을 참조.
+//!
+//! R3d: 소프트웨어 MFT를 대체. GPU 색변환(VideoProcessor)에서 나온 NV12를 인코딩.
+
+extern crate ffmpeg_next as ffmpeg;
+
+use anyhow::{anyhow, bail, Result};
+use ffmpeg::{codec, encoder, format, frame, Dictionary, Packet, Rational};
+
+/// 인코딩된 H.264 프레임 (Annex-B).
+pub struct EncodedPacket {
+    pub data: Vec<u8>,
+    pub is_key_frame: bool,
+}
+
+pub struct QsvEncoder {
+    encoder: encoder::video::Encoder,
+    width: u32,
+    height: u32,
+    pts: i64,
+    force_idr: bool,
+}
+
+impl QsvEncoder {
+    /// h264_qsv 인코더 생성. `bitrate_bps`, `fps`로 저지연 구성.
+    pub fn new(width: u32, height: u32, fps: u32, bitrate_bps: u32) -> Result<Self> {
+        // 전역 1회 초기화(중복 무해).
+        ffmpeg::init().map_err(|e| anyhow!("ffmpeg init: {e}"))?;
+
+        let codec = encoder::find_by_name("h264_qsv").ok_or_else(|| anyhow!("h264_qsv not found"))?;
+        let ctx = codec::context::Context::new_with_codec(codec);
+        let mut video = ctx.encoder().video().map_err(|e| anyhow!("encoder video ctx: {e}"))?;
+
+        video.set_width(width);
+        video.set_height(height);
+        video.set_format(format::Pixel::NV12);
+        video.set_time_base(Rational(1, fps as i32));
+        video.set_frame_rate(Some(Rational(fps as i32, 1)));
+        video.set_bit_rate(bitrate_bps as usize);
+        video.set_max_bit_rate(bitrate_bps as usize);
+        // 무한 GOP: 키프레임은 온디맨드로만 (Moonlight RequestIdrFrame).
+        video.set_gop(i32::MAX as u32);
+        video.set_max_b_frames(0);
+
+        let mut opts = Dictionary::new();
+        opts.set("preset", "veryfast");
+        opts.set("forced_idr", "1");      // pict_type=I 강제 시 진짜 IDR + SPS/PPS.
+        opts.set("low_delay_brc", "1");   // 저지연 레이트컨트롤.
+        opts.set("async_depth", "1");     // 프레임 지연 최소화.
+        opts.set("recovery_point_sei", "0");
+
+        let encoder = video.open_with(opts).map_err(|e| anyhow!("open h264_qsv: {e}"))?;
+
+        Ok(Self { encoder, width, height, pts: 0, force_idr: false })
+    }
+
+    /// 다음 프레임을 IDR(키프레임)로 강제.
+    pub fn request_idr(&mut self) {
+        self.force_idr = true;
+    }
+
+    /// NV12 평면 데이터(Y: width*height, UV: width*height/2, 타이트 팩)를 인코딩.
+    /// 준비된 Annex-B 패킷들을 반환.
+    pub fn encode(&mut self, nv12: &[u8]) -> Result<Vec<EncodedPacket>> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let expected = w * h * 3 / 2;
+        if nv12.len() < expected {
+            bail!("NV12 too small: {} < {}", nv12.len(), expected);
+        }
+
+        let mut vframe = frame::Video::new(format::Pixel::NV12, self.width, self.height);
+        // Y 평면 (stride 고려 복사).
+        {
+            let stride = vframe.stride(0);
+            let dst = vframe.data_mut(0);
+            for y in 0..h {
+                dst[y * stride..y * stride + w].copy_from_slice(&nv12[y * w..y * w + w]);
+            }
+        }
+        // UV 평면 (h/2 행, width 바이트).
+        {
+            let uv_off = w * h;
+            let stride = vframe.stride(1);
+            let dst = vframe.data_mut(1);
+            for y in 0..(h / 2) {
+                dst[y * stride..y * stride + w]
+                    .copy_from_slice(&nv12[uv_off + y * w..uv_off + y * w + w]);
+            }
+        }
+        vframe.set_pts(Some(self.pts));
+        if self.force_idr {
+            vframe.set_kind(ffmpeg::picture::Type::I);
+            self.force_idr = false;
+        } else {
+            vframe.set_kind(ffmpeg::picture::Type::None);
+        }
+        self.pts += 1;
+
+        self.encoder.send_frame(&vframe).map_err(|e| anyhow!("send_frame: {e}"))?;
+        self.drain()
+    }
+
+    fn drain(&mut self) -> Result<Vec<EncodedPacket>> {
+        let mut out = Vec::new();
+        let mut pkt = Packet::empty();
+        while self.encoder.receive_packet(&mut pkt).is_ok() {
+            if let Some(data) = pkt.data() {
+                out.push(EncodedPacket { data: data.to_vec(), is_key_frame: pkt.is_key() });
+            }
+        }
+        Ok(out)
+    }
+}
