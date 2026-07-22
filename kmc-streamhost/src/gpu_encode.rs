@@ -71,6 +71,7 @@ pub struct ZeroCopyEncoder {
     qsv_frames: *mut AVBufferRef,
     ring: Vec<MappedSlot>, // 미리 매핑된 프레임 링(재사용).
     ring_pos: usize,
+    staged: usize,          // 직전 stage() 가 고른 링 슬롯(submit 에서 사용).
     ctx: ID3D11DeviceContext, // CopySubresourceRegion 용(우리 디바이스 컨텍스트)
     _device: ID3D11Device,    // 우리 ref 유지
     pkt: *mut AVPacket,
@@ -233,6 +234,7 @@ impl ZeroCopyEncoder {
                 qsv_frames,
                 ring,
                 ring_pos: 0,
+                staged: 0,
                 ctx: ctx.clone(),
                 _device: device.clone(),
                 pkt,
@@ -243,23 +245,26 @@ impl ZeroCopyEncoder {
         }
     }
 
-    /// NV12 D3D11 텍스처(GpuConverter 출력)를 GPU 상에서 인코딩. CPU 복사 없음.
-    pub fn encode(&mut self, nv12_tex: &ID3D11Texture2D, force_idr: bool) -> Result<Vec<EncodedPacket>> {
+    /// NV12 텍스처를 다음 링 슬롯에 복사만 한다(빠른 GPU 복사). 이후 submit 으로 인코딩.
+    /// 크로스-디바이스 경로: 공유 텍스처 반납 전 이 복사만 하고 keyed mutex 를 빨리 놓기 위함.
+    pub fn stage(&mut self, nv12_tex: &ID3D11Texture2D) -> Result<()> {
         unsafe {
-            // 다음 링 슬롯 선택(N 프레임 뒤 재사용 → 이전 제출은 이미 drain 되어 안전).
             let idx = self.ring_pos;
             self.ring_pos = (self.ring_pos + 1) % self.ring.len();
+            self.staged = idx;
             let tex_ptr = self.ring[idx].tex;
             let sub_index = self.ring[idx].index;
-            let qf = self.ring[idx].qsv_frame;
-
-            // GPU→GPU 복사: NV12 텍스처 → 미리 매핑된 슬롯의 D3D11 텍스처(배열 슬라이스). 동일 immediate
-            // context 라 CopySubresourceRegion 과 mfx 인코딩이 순서 보장(명시 flush 불필요).
             let dst_tex = ID3D11Texture2D::from_raw_borrowed(&tex_ptr)
                 .ok_or_else(|| anyhow!("null ring texture"))?;
             self.ctx.CopySubresourceRegion(dst_tex, sub_index, 0, 0, 0, nv12_tex, 0, None);
+            Ok(())
+        }
+    }
 
-            // 이미 QSV 로 매핑된 프레임 재제출: 프레임당 alloc/map/free 없음.
+    /// 직전 stage 한 슬롯의 (이미 매핑된) QSV 프레임을 mfx 에 제출하고 패킷을 뽑는다(느린 부분).
+    pub fn submit(&mut self, force_idr: bool) -> Result<Vec<EncodedPacket>> {
+        unsafe {
+            let qf = self.ring[self.staged].qsv_frame;
             (*qf).pts = self.pts;
             self.pts += 1;
             (*qf).pict_type = if force_idr { AV_PICTURE_TYPE_I } else { AV_PICTURE_TYPE_NONE };
@@ -285,6 +290,12 @@ impl ZeroCopyEncoder {
             }
             Ok(out)
         }
+    }
+
+    /// stage + submit (단독 테스트 및 하위호환 경로).
+    pub fn encode(&mut self, nv12_tex: &ID3D11Texture2D, force_idr: bool) -> Result<Vec<EncodedPacket>> {
+        self.stage(nv12_tex)?;
+        self.submit(force_idr)
     }
 }
 

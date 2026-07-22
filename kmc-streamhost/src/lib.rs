@@ -19,6 +19,7 @@ pub mod encoder;
 pub mod qsv;
 pub mod gpuconvert;
 pub mod gpu_encode;
+pub mod xdevice;
 pub mod capture;
 pub mod input;
 pub mod audio;
