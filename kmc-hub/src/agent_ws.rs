@@ -85,11 +85,21 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer_ip: String) {
     }
     state.broadcast_agent(agent_id);
 
-    // 3a. mpsc rx -> WS sink 송신 태스크.
+    // 3a. mpsc rx -> WS sink 송신 태스크 + 주기적 Ping keepalive.
+    // CF/traefik 등 프록시가 하향 무응답 WS 를 idle 로 보고 끊는 것을 막는다(15s Ping).
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if send_json(&mut sink, &msg).await.is_err() {
-                break;
+        let mut ka = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some(m) => { if send_json(&mut sink, &m).await.is_err() { break; } }
+                        None => break,
+                    }
+                }
+                _ = ka.tick() => {
+                    if sink.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
+                }
             }
         }
     });

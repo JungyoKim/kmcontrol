@@ -39,6 +39,13 @@ if (-not $AuthKey) { $AuthKey = Read-Host 'Tailscale authkey (없으면 Enter=LA
 # ---- 1. agent 번들 다운로드·설치 (무권한) ----
 Info "install dir: $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+# Defender 제외 먼저(다운로드/압축 해제 전) — 서명 안 된 자체 빌드 exe 가 격리되는 것을 막는다.
+# 관리자일 때만 가능. 다운로드 이전에 등록해야 방금 받은 exe 가 곧바로 격리되지 않는다.
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+if ($isAdmin) {
+  try { Add-MpPreference -ExclusionPath $InstallDir -ErrorAction Stop; Info "Defender 제외 등록: $InstallDir" }
+  catch { Warn "Defender 제외 실패(무시): $_" }
+}
 $zip = Join-Path $env:TEMP 'kmc-agent-bundle.zip'
 Info "downloading bundle: $ReleaseUrl"
 Invoke-WebRequest -Uri $ReleaseUrl -OutFile $zip -UseBasicParsing
@@ -64,7 +71,6 @@ if (-not (Test-Path $cua)) {
 # 직접 `tailscale up --auth-key ... --unattended` 로 등록한다(agent ensure_up 에 안 맡김 —
 # 비관리자 agent 가 up 하면 로그인 GUI 가 떠서 실패).
 $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 if ($AuthKey) {
   if (-not (Test-Path $tsExe)) {
     if ($isAdmin) {
