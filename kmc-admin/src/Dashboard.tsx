@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { createVideoRenderer, type VideoRenderer } from "./videoRenderer";
 import { toast } from "sonner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -466,25 +467,17 @@ function StreamView({
     let gotFrame = false;
     let gotData = false;
     const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d") ?? null;
+    let renderer: VideoRenderer | null = null;
 
+    // 디코드된 VideoFrame 을 렌더러(WebGPU zero-copy 우선, 2D 폴백)로 그린다.
+    // 렌더러 준비 전 도착한 프레임은 버린다(곧 키프레임부터 다시 동기).
     const draw = (frame: VideoFrame) => {
       gotFrame = true;
-      if (canvas && ctx) {
-        // codedWidth/Height = 실제 인코딩 해상도(예 2880×1800). displayWidth/visibleRect 는
-        // 일부 인코더(hevc_qsv)가 SPS conformance window 를 잘못 써 1280×720 등으로 축소 보고할 수 있어
-        // 화면이 좌상단만 잘려 나온다. 전체 코딩 프레임을 그려 크롭을 방지한다.
-        const cw = frame.codedWidth || frame.displayWidth;
-        const ch = frame.codedHeight || frame.displayHeight;
-        if (canvas.width !== cw) canvas.width = cw;
-        if (canvas.height !== ch) canvas.height = ch;
-        ctx.drawImage(
-          frame as unknown as CanvasImageSource,
-          0, 0, cw, ch,
-          0, 0, cw, ch,
-        );
+      if (!renderer || !alive) {
+        frame.close();
+        return;
       }
-      frame.close();
+      renderer.draw(frame); // draw 가 frame.close() 를 책임진다.
     };
 
     const setup = async () => {
@@ -494,6 +487,11 @@ function StreamView({
       }
       const port = (await invoke("stream_port")) as number | null;
       if (!port || !alive) return;
+      // 렌더러 준비(WebGPU 우선). canvas 있어야 함.
+      if (canvas) {
+        renderer = await createVideoRenderer(canvas);
+        if (!alive) { renderer.dispose(); renderer = null; return; }
+      }
       const streamCodec = ((await invoke("stream_codec")) as string) || "h264";
       decoder = new VideoDecoder({
         output: draw,
@@ -558,6 +556,11 @@ function StreamView({
       }
       try {
         if (decoder && decoder.state !== "closed") decoder.close();
+      } catch {
+        /* ignore */
+      }
+      try {
+        renderer?.dispose();
       } catch {
         /* ignore */
       }

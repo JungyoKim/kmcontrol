@@ -80,11 +80,9 @@ impl StreamState {
         let (au_tx, au_rx) = std::sync::mpsc::channel::<AuFrame>();
         std::thread::spawn(move || {
             // tx가 dr_cleanup에서 드롭되면 recv가 끝나 스레드 종료.
+            // au.data 는 이미 self-framed([0]=타입) — 재복사 없이 그대로 팬아웃.
             for au in au_rx {
-                let mut framed = Vec::with_capacity(1 + au.data.len());
-                framed.push(if au.keyframe { 1u8 } else { 0u8 });
-                framed.extend_from_slice(&au.data);
-                let _ = bcast.send(Arc::new(framed));
+                let _ = bcast.send(Arc::new(au.data));
             }
         });
         // Opus 오디오 프레임 팬아웃 (프레임 = Opus 패킷 그대로).
@@ -183,6 +181,8 @@ async fn serve_client(
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
+    // 루프백이라도 Nagle 이 작은 프레임을 최대 ~40ms 버퍼링해 지연을 유발한다 — 즉시 전송.
+    let _ = sock.set_nodelay(true);
     let ws = match tokio_tungstenite::accept_async(sock).await {
         Ok(w) => w,
         Err(_) => return,

@@ -76,7 +76,8 @@ fn main() -> Result<()> {
         match au_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(au) => {
                 frames += 1;
-                let nals = classify_nals(&au.data, hevc);
+                // au.data[0] 은 프레임 타입 바이트(self-framed) — Annex-B 는 그 이후.
+                let nals = classify_nals(&au.data[1..], hevc);
                 for t in &nals {
                     seen.insert(*t);
                 }

@@ -15,7 +15,10 @@ use crate::pair::{LaunchResult, PairedHost, ServerInfo};
 // Limelight.h: DR_OK=0, DR_NEED_IDR=-1 (bindgen이 #define을 상수로 안 냄 → 수작업 미러).
 const DR_OK: c_int = 0;
 
-/// 인코딩된 H.264 access unit (Annex-B). ffmpeg 디코드 없이 프론트(WebCodecs)로 그대로 전달한다.
+/// 인코딩된 H.264/HEVC access unit. ffmpeg 디코드 없이 프론트(WebCodecs)로 그대로 전달한다.
+/// `data` 는 self-framed: `[0]`=타입(1=key/0=delta), 이후 Annex-B(스타트코드 내장).
+/// 이 레이아웃이 admin↔프론트 WS 와이어 계약과 동일해, 팬아웃 시 재복사가 필요 없다.
+/// `keyframe` 은 편의용 사본(=data[0]==1).
 pub struct AuFrame {
     pub keyframe: bool,
     pub data: Vec<u8>,
@@ -66,21 +69,24 @@ extern "C" fn dr_submit_decode_unit(du: *mut DECODE_UNIT) -> c_int {
         return DR_OK;
     }
     let du = unsafe { &*du };
-    // 버퍼체인 순회 → 단일 Annex-B 버퍼 (data에 start code 내장).
-    let mut annexb: Vec<u8> = Vec::with_capacity(du.fullLength.max(0) as usize);
+    let keyframe = du.frameType == FRAME_TYPE_IDR as c_int;
+    // 와이어 계약과 동일하게 self-framed 버퍼로 만든다: [0]=타입(1=key/0=delta), 이후 Annex-B.
+    // 이렇게 하면 admin 팬아웃 스레드가 타입 바이트를 붙이려 재복사할 필요가 없다(복사 1회 절감).
+    let cap = 1 + du.fullLength.max(0) as usize;
+    let mut framed: Vec<u8> = Vec::with_capacity(cap);
+    framed.push(if keyframe { 1u8 } else { 0u8 });
     let mut entry = du.bufferList;
     while !entry.is_null() {
         let e = unsafe { &*entry };
         if !e.data.is_null() && e.length > 0 {
             let slice = unsafe { std::slice::from_raw_parts(e.data as *const u8, e.length as usize) };
-            annexb.extend_from_slice(slice);
+            framed.extend_from_slice(slice);
         }
         entry = e.next;
     }
-    let keyframe = du.frameType == FRAME_TYPE_IDR as c_int;
     if let Some(tx) = AU_SINK.lock().as_ref() {
         // 수신자(WS 클라이언트)가 없으면 드롭됨 — 재연결 시 IDR을 다시 요청하므로 무해.
-        let _ = tx.send(AuFrame { keyframe, data: annexb });
+        let _ = tx.send(AuFrame { keyframe, data: framed });
     }
     DR_OK
 }
