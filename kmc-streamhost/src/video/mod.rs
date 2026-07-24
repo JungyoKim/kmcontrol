@@ -26,15 +26,16 @@ pub type FrameSender = mpsc::Sender<EncodedFrame>;
 pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: std::sync::Arc<std::sync::atomic::AtomicBool>, client_active: std::sync::Arc<std::sync::atomic::AtomicBool>, bitrate: std::sync::Arc<crate::bitrate::BitrateController>) -> Result<FrameSender> {
     let addr: SocketAddr = format!("{bind_ip}:{port}").parse().context("parse video addr")?;
     let socket = UdpSocket::bind(addr).await.context("bind video udp")?;
-    // 송신 버퍼 확대: 4K 키프레임(수백 shard) 버스트 유실 방지 (Sunshine도 큰 SO_SNDBUF 사용).
+    // 송신 버퍼는 작게(512KB). 크게 잡으면(과거 8MB) 저대역 회선에서 프레임이 커널 큐에 수백ms~초
+    // 쌓여 지연(bufferbloat)이 커진다. 작은 버퍼 = 오래된 데이터를 못 쌓아 지연을 낮게 유지.
+    // 512KB 는 4K IDR 한 장(~수백 shard) 버스트는 담되 그 이상은 페이싱/드롭으로 처리.
     {
         use socket2::SockRef;
         let sref = SockRef::from(&socket);
-        // 8MB 시도 (OS가 상한 clamp).
-        if let Err(e) = sref.set_send_buffer_size(8 * 1024 * 1024) {
-            tracing::warn!(error=%e, "failed to enlarge UDP send buffer");
+        if let Err(e) = sref.set_send_buffer_size(512 * 1024) {
+            tracing::warn!(error=%e, "failed to set UDP send buffer");
         } else {
-            tracing::info!(send_buf = sref.send_buffer_size().unwrap_or(0), "UDP send buffer set");
+            tracing::info!(send_buf = sref.send_buffer_size().unwrap_or(0), "UDP send buffer set (small, low-latency)");
         }
     }
     tracing::info!(%addr, "video UDP listening (waiting for client PING)");
@@ -115,8 +116,17 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                         sequence_number = 0;
                         stream_packet_index = 0;
                     }
+                    // 프레임 드롭(지연 억제): 채널에 뒤이어 쌓인 프레임이 있으면 오래된 것을 버리고
+                    // 가장 최신 프레임만 보낸다. 저대역 회선에서 인코더가 회선보다 빨리 생성하면
+                    // 프레임이 밀리는데, 오래된 프레임을 보내봐야 지연만 쌓이므로 최신 것만 전송한다.
+                    let mut frame = frame;
+                    let mut dropped = 0u32;
+                    while let Ok(newer) = rx.try_recv() {
+                        frame = newer;
+                        dropped += 1;
+                    }
                     frame_number += 1;
-                    // 동적 FEC: 최근 손실률 기반 목표 parity%(20~50) 를 프레임마다 적용.
+                    // 동적 FEC: 최근 손실률 기반 목표 parity% 를 프레임마다 적용.
                     let fec_pct = bitrate.poll_fec_percentage() as usize;
                     let shards = packetizer::packetize_frame(
                         &frame.data,
@@ -128,23 +138,27 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                         frame.rtp_timestamp,
                         fec_pct,
                     );
-                    // 버스트 유실 방지: shard를 배치로 나눠 송신하고 배치 사이에 짧게 양보.
-                    // (Sunshine의 send_batch_size ~64KB 페이싱을 모사.)
-                    const SEND_BATCH: usize = 40; // ~40 × 1.4KB ≈ 56KB per batch
+                    // 페이싱(bufferbloat 방지): shard 를 목표 비트레이트 속도에 맞춰 균일하게 흘려보낸다.
+                    // 한 번에 쏟아부으면(버스트) 셀룰러가 못 받아 뭉텅이 손실 → 손실률 폭등 → 알고리즘이
+                    // 회선을 과소평가한다. 목표 bps 로 나눈 배치 간 지연으로 회선 속도에 맞춰 보낸다.
+                    let target_bps = bitrate.poll_target().max(500_000) as u64;
+                    const SEND_BATCH: usize = 16; // ~16 × 1KB ≈ 16KB per batch (작게 = 매끄러운 페이싱)
+                    let batch_bytes = (SEND_BATCH * packet_size) as u64;
+                    // 이 배치를 목표 속도로 보내는 데 걸릴 시간(us) = bytes*8 / bps * 1e6.
+                    let batch_delay = std::time::Duration::from_micros(batch_bytes * 8 * 1_000_000 / target_bps);
                     for (i, shard) in shards.iter().enumerate() {
                         if let Err(e) = socket.send_to(shard, dst).await {
                             tracing::warn!(error=%e, "video send failed");
                             break;
                         }
-                        // 배치 경계마다 커널 송신 큐가 빠질 시간을 준다.
                         if (i + 1) % SEND_BATCH == 0 {
-                            tokio::task::yield_now().await;
+                            tokio::time::sleep(batch_delay).await;
                         }
                     }
                     if frame_number % 60 == 1 {
-                        tracing::info!(frame_number, shards = shards.len(), fec_pct, "video frames flowing");
+                        tracing::info!(frame_number, shards = shards.len(), fec_pct, dropped, target_kbps = target_bps / 1000, "video frames flowing");
                     } else {
-                        tracing::trace!(frame_number, shards = shards.len(), fec_pct, "video frame sent");
+                        tracing::trace!(frame_number, shards = shards.len(), fec_pct, dropped, "video frame sent");
                     }
                 }
 
