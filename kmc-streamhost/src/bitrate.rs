@@ -31,6 +31,8 @@ const RECOVER_INTERVAL_MS: u128 = 2000;
 const RECOVER_STEP_FRAC: f64 = 0.03;
 /// 이 EWMA 손실률 이상이면 회복(증가)을 아예 보류한다 — 잔여 손실이 있으면 올리지 않는다.
 const RECOVER_LOSS_GATE: f64 = 0.02;
+/// 손실 없이 이만큼 지나면 학습 상한을 재탐색(느린 상향). 회선 회복 가능성 대비.
+const REPROBE_AFTER_MS: u128 = 8000;
 /// FEC parity 하한(%): 무손실~경미 손실 시. Moonlight 기본보다 약간 낮춰 평상시 전송량 절감.
 const FEC_MIN_PCT: u32 = 15;
 /// FEC parity 상한(%): 경미한 랜덤 손실 복구용. 혼잡 회선에선 FEC 증가가 오히려 독이므로
@@ -67,6 +69,9 @@ pub struct BitrateController {
     timing: Mutex<Timing>,
     /// 최근 손실률 EWMA(0.0~1.0) 를 1e6 스케일 고정소수로 저장(원자적). FEC% 계산에 사용.
     loss_ewma_ppm: AtomicU32,
+    /// 학습된 안전 상한(bps): 손실로 붕괴한 지점 기록. 회복은 이 값을 넘지 않아 톱니파를 막는다.
+    /// 손실 없이 오래 안정되면 서서히 상향(회선이 좋아졌을 수도 있으므로 재탐색).
+    learned_ceiling: AtomicU32,
 }
 
 impl BitrateController {
@@ -82,6 +87,7 @@ impl BitrateController {
                 last_recover: now,
             }),
             loss_ewma_ppm: AtomicU32::new(0),
+            learned_ceiling: AtomicU32::new(0),
         })
     }
 
@@ -102,6 +108,8 @@ impl BitrateController {
         t.last_decrease = stale_instant();
         t.last_recover = Instant::now();
         self.loss_ewma_ppm.store(0, Ordering::Release);
+        // 학습 상한을 ceiling 으로 초기화(아직 실패 미관측 → 전체 대역 탐색 허용).
+        self.learned_ceiling.store(ceiling, Ordering::Release);
     }
 
     /// 손실 신호(FEC status 도착). `loss_fraction` = 0.0~1.0(수신 실패 패킷 비율).
@@ -136,10 +144,20 @@ impl BitrateController {
         let next = ((cur as f64 * factor) as u32).max(min);
         self.target.store(next, Ordering::Release);
         t.last_decrease = now;
+        // 학습 상한 갱신: 유의미한 손실(≥10%)이 난 현재 비트레이트는 지속 불가능하다고 보고
+        // 그 85% 를 안전 상한으로 기록(하향 래칫만 — 더 낮은 실패점만 반영). 회복이 이 위로
+        // 다시 올라가 또 무너지는 톱니파를 막는다. floor 밑으로는 안 내림.
+        if loss_fraction >= 0.10 {
+            let collapse = (cur as f64 * 0.85) as u32;
+            let prev_lc = self.learned_ceiling.load(Ordering::Acquire);
+            let new_lc = collapse.max(min).min(prev_lc);
+            self.learned_ceiling.store(new_lc, Ordering::Release);
+        }
         tracing::info!(
             loss = loss_fraction,
             from = cur,
             to = next,
+            learned_ceiling = self.learned_ceiling.load(Ordering::Acquire),
             "bitrate: loss → decrease"
         );
     }
@@ -152,18 +170,13 @@ impl BitrateController {
             return 0;
         }
         let cur = self.target.load(Ordering::Acquire);
-        if cur >= max {
-            return cur;
-        }
         let now = Instant::now();
         let mut t = self.timing.lock();
-        // 마지막 손실 후 충분히 지났고, 회복 주기가 됐으면 한 스텝 올린다.
         let since_loss = t.last_loss.map_or(u128::MAX, |l| now.duration_since(l).as_millis());
         if since_loss < RECOVER_DELAY_MS {
             return cur;
         }
-        // 잔여 손실 게이트: EWMA 손실이 남아있으면 회복하지 않는다. 손실이 있는데 올리면
-        // 즉시 재손실 → 진동. 손실이 완전히 감쇠(EWMA<gate)해야 비로소 올린다.
+        // 잔여 손실 게이트: EWMA 손실이 남아있으면 회복하지 않는다(진동 방지).
         let ewma = self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6;
         if ewma >= RECOVER_LOSS_GATE {
             return cur;
@@ -171,11 +184,23 @@ impl BitrateController {
         if now.duration_since(t.last_recover).as_millis() < RECOVER_INTERVAL_MS {
             return cur;
         }
+        // 재탐색: 손실 없이 오래(REPROBE_AFTER) 안정되면 학습 상한을 조금씩 올린다(회선이
+        // 좋아졌을 수 있으므로). 상시가 아니라 아주 느리게 — 톱니파 재발 방지.
+        let mut lc = self.learned_ceiling.load(Ordering::Acquire);
+        if lc < max && since_loss >= REPROBE_AFTER_MS {
+            lc = ((lc as f64 * 1.05) as u32).min(max);
+            self.learned_ceiling.store(lc, Ordering::Release);
+        }
+        // 회복 상한 = 학습된 안전 상한(협상 max 가 아니라). 여기서 멈춰 톱니파를 막는다.
+        let cap = lc.min(max);
+        if cur >= cap {
+            return cur;
+        }
         let step = ((max as f64 * RECOVER_STEP_FRAC) as u32).max(250_000);
-        let next = cur.saturating_add(step).min(max);
+        let next = cur.saturating_add(step).min(cap);
         self.target.store(next, Ordering::Release);
         t.last_recover = now;
-        tracing::debug!(from = cur, to = next, "bitrate: recover → increase");
+        tracing::debug!(from = cur, to = next, cap, "bitrate: recover → increase");
         next
     }
 
@@ -222,6 +247,7 @@ impl Default for BitrateController {
                 last_recover: now,
             }),
             loss_ewma_ppm: AtomicU32::new(0),
+            learned_ceiling: AtomicU32::new(0),
         }
     }
 }
@@ -321,6 +347,31 @@ mod tests {
             c.poll_target();
         }
         assert_eq!(c.poll_target(), 20_000_000);
+    }
+
+    #[test]
+    fn learned_ceiling_caps_recovery_after_collapse() {
+        let c = BitrateController::default();
+        c.configure(20_000_000); // start 10M, learned_ceiling 20M
+        // 8M 부근에서 손실 붕괴 시뮬레이션: target 을 8M 로 두고 큰 손실.
+        c.target.store(8_000_000, Ordering::Release);
+        c.on_loss(0.4); // learned_ceiling → min(20M, 8M*0.85=6.8M) = 6.8M
+        assert_eq!(c.learned_ceiling.load(Ordering::Acquire), 6_800_000);
+        // 손실 없이 회복시켜도 학습 상한(6.8M) 근처에서 멈춰야 한다(20M 로 안 올라감).
+        // reprobe 는 8s 후에만 — 여기선 손실 후 6s 로 유지해 reprobe 억제.
+        for _ in 0..50 {
+            {
+                let mut t = c.timing.lock();
+                let past = Instant::now() - std::time::Duration::from_millis(6000);
+                t.last_loss = Some(past);
+                t.last_recover = past;
+            }
+            c.loss_ewma_ppm.store(0, Ordering::Release);
+            c.poll_target();
+        }
+        let settled = c.poll_target();
+        assert!(settled <= 6_800_000, "recovery must cap at learned ceiling, got {settled}");
+        assert!(settled >= 6_000_000, "should recover up to near learned ceiling, got {settled}");
     }
 
     #[test]
