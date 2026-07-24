@@ -178,8 +178,13 @@ pub fn start_stream(
         cfg.height = height as c_int;
         cfg.fps = fps as c_int;
         cfg.bitrate = bitrate_kbps as c_int;
+        // packetSize 1392 는 LAN 기준. STREAM_CFG_AUTO 가 원격(공인/CGNAT 주소)으로 판정하면
+        // moonlight-common-c 가 자동으로 1024 로 캡해 MTU 단편화(셀룰러 끊김의 주원인)를 막는다.
         cfg.packetSize = 1392;
-        cfg.streamingRemotely = STREAM_CFG_LOCAL as c_int;
+        // STREAM_CFG_AUTO: 대상 주소가 RFC1918 사설망이면 LOCAL, 아니면 REMOTE 로 자동 결정.
+        // tailnet(100.x CGNAT)·공인 IP 는 REMOTE 로 판정돼 원격 최적화(작은 패킷·대역폭 여유·
+        // 오디오 96kbps)가 켜진다. 핫스팟/인터넷 경유에서 단편화·혼잡 끊김을 크게 줄인다.
+        cfg.streamingRemotely = STREAM_CFG_AUTO as c_int;
         cfg.audioConfiguration = make_stereo_audio_config();
         // H.264 는 항상 지원. HEVC 는 클라이언트(WebCodecs)가 디코드 가능할 때만 요청한다.
         // 서버가 HEVC 가능하면 HEVC 로 협상되고, 협상 포맷은 dr_setup(video_format)으로 확인해
