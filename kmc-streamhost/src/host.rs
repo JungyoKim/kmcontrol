@@ -128,6 +128,10 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
                 tracing::info!("PLAY on existing pipeline — requesting IDR + session reset");
                 session_reset.store(true, std::sync::atomic::Ordering::Release);
                 idr_req.store(true, std::sync::atomic::Ordering::Release);
+                // 재연결 시에도 비트레이트 컨트롤러를 리셋한다 — 안 하면 이전 세션의 학습된
+                // learned_ceiling/probe_cap(예: 셀룰러 붕괴로 1M)이 남아 새 세션이 저대역에 갇힌다.
+                let ceiling = if ctx.bitrate_bps == 0 { 15_000_000 } else { ctx.bitrate_bps };
+                bitrate_ctl.configure(ceiling);
                 return;
             }
 

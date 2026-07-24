@@ -209,7 +209,10 @@ impl BitrateController {
         if cur >= cap {
             return cur;
         }
-        let step = ((max as f64 * RECOVER_STEP_FRAC) as u32).max(250_000);
+        // 회복 스텝: max 의 3% 와 현재값의 10% 중 큰 값. 저대역(예 1M)에 갇혔을 때 현재 비례
+        // 스텝으로 빠르게 제 대역까지 올라오고(1M→1.1M→1.2M... 가 아니라 +10%씩), 고대역에선
+        // max 비례로 완만히. 손실 나면 즉시 하향되므로 공격적 회복이 안전하다.
+        let step = ((max as f64 * RECOVER_STEP_FRAC) as u32).max((cur as f64 * 0.10) as u32).max(250_000);
         let next = cur.saturating_add(step).min(cap);
         self.target.store(next, Ordering::Release);
         t.last_recover = now;
