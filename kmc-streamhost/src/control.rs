@@ -92,6 +92,18 @@ async fn run_loop(mut host: Host, session: SessionState, trigger: VideoTrigger, 
         match host.service(Duration::from_millis(10)).await {
             Ok(Some(Event::Connect { peer_id, .. })) => {
                 tracing::info!(?peer_id, "control peer connected");
+                // 새 admin 이 붙으면 이전 peer 들을 즉시 정리한다. control 은 단일 제어자만 유효하고,
+                // ENet host 는 peer 슬롯이 4개뿐 — 재연결 때 이전(좀비/미정리) peer 가 슬롯을 물고
+                // 있으면 반복할수록 슬롯이 소진돼 접속이 느려지거나 실패한다(재연결 점진 지연의 원인).
+                let stale: Vec<PeerId> = host
+                    .peers()
+                    .filter(|p| p.id() != peer_id && p.state() == PeerState::Connected)
+                    .map(|p| p.id())
+                    .collect();
+                for id in stale {
+                    tracing::info!(?id, "reaping stale control peer");
+                    host.disconnect_now(id, 0);
+                }
                 connected_peer = Some(peer_id);
             }
             Ok(Some(Event::Disconnect { peer_id, .. })) => {

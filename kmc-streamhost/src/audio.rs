@@ -29,8 +29,24 @@ pub async fn start(bind_ip: &str, port: u16) -> Result<()> {
     std::thread::Builder::new()
         .name("audio-capture".into())
         .spawn(move || {
-            if let Err(e) = capture_encode_loop(tx) {
-                tracing::error!(error=%e, "audio capture/encode loop ended");
+            // 캡처 루프가 죽으면(장치 변경/절전으로 WASAPI 이벤트 실패 등) 자동 재초기화.
+            // 그냥 두면 오디오만 영구 무음이 되고 pipeline_started 가드 때문에 재시작도 안 되므로,
+            // 여기서 감시·재시도해 스스로 복구한다. tx(수신자)가 살아있는 한 계속 시도.
+            loop {
+                match capture_encode_loop(tx.clone()) {
+                    Ok(()) => {
+                        // 정상 종료 = 수신자(tx) 드롭 → 스트림 자체가 끝난 것. 감시 종료.
+                        tracing::info!("audio capture loop ended normally (receiver gone)");
+                        break;
+                    }
+                    Err(e) => {
+                        if tx.is_closed() {
+                            break; // 수신자 없음 → 재시도 무의미.
+                        }
+                        tracing::warn!(error=%e, "audio capture loop died — restarting in 1s");
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
             }
         })
         .context("spawn audio capture thread")?;
@@ -171,10 +187,10 @@ fn capture_encode_loop(tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) -> Resul
             }
         }
         if h_event.wait_for_event(1_000_000).is_err() {
-            tracing::warn!("audio capture event wait failed; stopping");
+            // 이벤트 대기 실패 = 장치가 바뀌었거나 클라이언트가 죽음. Err 로 반환해 감시 스레드가
+            // 장치를 다시 열어 재개하도록 한다(Ok 로 끝내면 영구 무음).
             let _ = audio_client.stop_stream();
-            break;
+            return Err(anyhow!("audio capture event wait failed (device changed?)"));
         }
     }
-    Ok(())
 }
