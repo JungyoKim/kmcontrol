@@ -149,59 +149,80 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
             let client_active = client_active.clone();
             tokio::spawn(async move {
                 trigger.wait().await;
-                tracing::info!("StartB received — beginning frame emission (persistent pipeline)");
+                tracing::info!("StartB received — beginning frame emission");
                 if dummy_video {
                     crate::video::spawn_dummy_generator(sender, ctx.fps.max(1));
+                    return;
+                }
+                // 해상도/비트레이트/코덱은 1회만 계산(세션 내 고정).
+                let (nw, nh) = match windows_capture::monitor::Monitor::primary() {
+                    Ok(m) => match (m.width(), m.height()) {
+                        (Ok(mw), Ok(mh)) => (mw.max(2), mh.max(2)),
+                        _ => (ctx.width.max(2), ctx.height.max(2)),
+                    },
+                    Err(_) => (ctx.width.max(2), ctx.height.max(2)),
+                };
+                let (bw, bh) = (ctx.width, ctx.height);
+                let (w, h) = if bw == 0 || bh == 0 || (bw >= nw && bh >= nh) {
+                    (nw, nh)
                 } else {
-                    // 비율은 항상 agent 네이티브 화면을 따른다. admin 이 보낸 w/h 는 "최대 박스"로
-                    // 해석 — 네이티브를 그 박스 안에 비율 유지로 축소(업스케일·왜곡 금지). 박스가
-                    // 네이티브보다 크거나 0 이면 네이티브 그대로. 짝수 정렬.
-                    let (nw, nh) = match windows_capture::monitor::Monitor::primary() {
-                        Ok(m) => match (m.width(), m.height()) {
-                            (Ok(mw), Ok(mh)) => (mw.max(2), mh.max(2)),
-                            _ => (ctx.width.max(2), ctx.height.max(2)),
-                        },
-                        Err(_) => (ctx.width.max(2), ctx.height.max(2)),
-                    };
-                    let (bw, bh) = (ctx.width, ctx.height);
-                    let (w, h) = if bw == 0 || bh == 0 || (bw >= nw && bh >= nh) {
-                        (nw, nh) // 박스 미지정/네이티브보다 큼 → 네이티브 그대로.
-                    } else {
-                        // 네이티브 AR 유지하며 박스에 맞춰 축소. scale = min(bw/nw, bh/nh).
-                        let s = (bw as f64 / nw as f64).min(bh as f64 / nh as f64);
-                        (((nw as f64 * s) as u32).max(2), ((nh as f64 * s) as u32).max(2))
-                    };
-                    let (w, h) = (w & !1, h & !1); // QSV 짝수 정렬.
-                    tracing::info!(nw, nh, box_w = bw, box_h = bh, out_w = w, out_h = h, "resolution: native AR fit to box");
-                    // fps = target 상한. admin 이 0(무제한)을 보내면 120 으로 캡(Sunshine 처럼
-                    // "무제한"은 상한 제거가 아니라 이벤트 구동으로 이 상한까지 뽑는 것). 인코더가
-                    // 그보다 느리면 자연히 낮아짐(2880×1800 은 ~55fps). 정적 화면은 min_fps 로 스로틀.
-                    let fps = if ctx.fps == 0 { 120 } else { ctx.fps };
-                    // 비트레이트 하한 = 해상도·fps 기반. 상한 60Mbps.
-                    let px_rate = (w as u64) * (h as u64) * (fps as u64);
-                    let bitrate_floor = ((px_rate as f64 * 0.10) as u64).min(60_000_000) as u32;
-                    let negotiated = if ctx.bitrate_bps == 0 { 15_000_000 } else { ctx.bitrate_bps };
-                    let bitrate = negotiated.max(bitrate_floor);
-                    // 협상된 코덱: video_format 1=HEVC, 0=H264. 클라(admin)가 H.264 만 요청하므로
-                    // 정상 경로에선 항상 0→h264_qsv. (hevc_qsv 는 이 GPU 에서 SPS crop 버그.)
-                    let codec = if ctx.video_format == 1 { "hevc_qsv" } else { "h264_qsv" };
-                    tracing::info!(w, h, fps, negotiated, bitrate_floor, bitrate, codec, "stream encoder selected");
-                    // 지속 파이프라인: stop_rx는 절대 set되지 않음(프로세스 종료 시까지 유지).
-                    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let flags = crate::capture::CaptureFlags {
-                        width: w,
-                        height: h,
-                        fps,
-                        bitrate_bps: bitrate,
-                        codec,
-                        sender,
-                        stop_rx: stop,
-                        idr_req,
-                        done,
-                        client_active,
-                    };
-                    crate::capture::spawn_capture(flags);
+                    let s = (bw as f64 / nw as f64).min(bh as f64 / nh as f64);
+                    (((nw as f64 * s) as u32).max(2), ((nh as f64 * s) as u32).max(2))
+                };
+                let (w, h) = (w & !1, h & !1);
+                let fps = if ctx.fps == 0 { 120 } else { ctx.fps };
+                let px_rate = (w as u64) * (h as u64) * (fps as u64);
+                let bitrate_floor = ((px_rate as f64 * 0.10) as u64).min(60_000_000) as u32;
+                let negotiated = if ctx.bitrate_bps == 0 { 15_000_000 } else { ctx.bitrate_bps };
+                let bitrate = negotiated.max(bitrate_floor);
+                let codec = if ctx.video_format == 1 { "hevc_qsv" } else { "h264_qsv" };
+                tracing::info!(w, h, fps, bitrate, codec, "stream encoder selected (on-demand pipeline)");
+
+                // 생명주기 감시: 클라이언트가 볼 때만 캡처+인코드 파이프라인을 띄운다.
+                // idle 이면 완전히 종료 → WGC 캡처 세션도 닫혀 노란 "캡처 중" 테두리가 사라진다.
+                // 재개 시 spawn_capture 로 새로 생성(리소스 재생성 — 첫 프레임까지 ~1초).
+                // (stop_flag, done_flag) of the live pipeline; None when nothing running.
+                let mut running: Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::atomic::AtomicBool>)> = None;
+                loop {
+                    let want = client_active.load(std::sync::atomic::Ordering::Relaxed);
+                    // 종료 진행 중이던 파이프라인이 완전히 내려갔으면 슬롯 비우기.
+                    if let Some((stop, done)) = &running {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed)
+                            && done.load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            running = None;
+                        }
+                    }
+                    let alive = running.as_ref().map_or(false, |(stop, _)| {
+                        !stop.load(std::sync::atomic::Ordering::Relaxed)
+                    });
+                    match (want, alive, running.is_some()) {
+                        // 클라이언트 있음 + 살아있는 파이프라인 없음 + 이전 것 완전 종료됨 → 새로 시작.
+                        (true, false, false) => {
+                            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let flags = crate::capture::CaptureFlags {
+                                width: w, height: h, fps, bitrate_bps: bitrate, codec,
+                                sender: sender.clone(),
+                                stop_rx: stop.clone(),
+                                idr_req: idr_req.clone(),
+                                done: done.clone(),
+                                client_active: client_active.clone(),
+                            };
+                            tracing::info!("client watching — starting capture pipeline");
+                            crate::capture::spawn_capture(flags);
+                            running = Some((stop, done));
+                        }
+                        // 클라이언트 없음 + 파이프라인 살아있음 → 종료 신호(WGC 세션 닫힘 → 노란 테두리 제거).
+                        (false, true, _) => {
+                            tracing::info!("no client — tearing down capture pipeline (removes capture border)");
+                            if let Some((stop, _)) = &running {
+                                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        _ => {}
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             });
         });
