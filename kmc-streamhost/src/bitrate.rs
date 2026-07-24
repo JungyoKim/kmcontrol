@@ -28,15 +28,17 @@ const RECOVER_DELAY_MS: u128 = 1500;
 const RECOVER_INTERVAL_MS: u128 = 1000;
 /// 회복 스텝 = ceiling(max) 의 이 비율만큼 매 주기 덧셈(≈20s 만에 floor→max).
 const RECOVER_STEP_FRAC: f64 = 0.05;
-/// FEC parity 하한(%): 무손실~경미 손실 시. Moonlight 기본과 동일.
-const FEC_MIN_PCT: u32 = 20;
-/// FEC parity 상한(%): 심한 손실 시. parity 를 늘려 버스트 손실을 복구한다.
-/// (셀룰러/핫스팟처럼 손실률이 FEC 복구 한계를 넘나드는 회선 대응.)
-const FEC_MAX_PCT: u32 = 50;
+/// FEC parity 하한(%): 무손실~경미 손실 시. Moonlight 기본보다 약간 낮춰 평상시 전송량 절감.
+const FEC_MIN_PCT: u32 = 15;
+/// FEC parity 상한(%): 경미한 랜덤 손실 복구용. 혼잡 회선에선 FEC 증가가 오히려 독이므로
+/// 상한을 25% 로 억제한다(과거 50% 는 shard 2배 → 혼잡 악화 → fps 붕괴를 유발했다).
+/// 심한 손실의 정답은 parity 증가가 아니라 비트레이트 하향이다.
+const FEC_MAX_PCT: u32 = 25;
 /// 손실률 EWMA 평활 계수(0~1). 클수록 최근 값에 민감. 프레임당 손실은 튀므로 완만하게.
 const LOSS_EWMA_ALPHA: f64 = 0.3;
 /// 이 EWMA 손실률(0~1)에서 FEC 가 상한에 도달한다. 그 이하는 선형 보간.
-const FEC_SATURATION_LOSS: f64 = 0.30;
+/// 낮게(0.10) 잡아 경미한 손실엔 빠르게 반응하되 상한 자체가 25% 라 폭증하지 않는다.
+const FEC_SATURATION_LOSS: f64 = 0.10;
 
 struct Timing {
     last_loss: Option<Instant>,
@@ -80,19 +82,22 @@ impl BitrateController {
         })
     }
 
-    /// PLAY 협상 후 경계값 설정. `ceiling` = 협상된 비트레이트(상한). floor 는 ceiling 의 1/8
-    /// (하한 500kbps 보장). 목표는 ceiling 에서 시작(좋은 네트워크 가정, 손실 시 낮아짐).
     pub fn configure(&self, ceiling_bps: u32) {
-        let ceiling = ceiling_bps.max(500_000);
-        let floor = (ceiling / 8).max(500_000).min(ceiling);
+        let ceiling = ceiling_bps.max(1_000_000);
+        // floor 는 절대 하한(1Mbps) — ceiling/8 은 고대역 협상 시 6M+ 로 과도해져 혼잡 회선에서
+        // 못 내려가는 문제가 있었다. 셀룰러/핫스팟이 감당할 최저치까지 내려가게 한다.
+        let floor = 1_000_000u32.min(ceiling);
+        // 시작 목표는 ceiling 이 아니라 중간값(가용 대역 모를 때 과도 전송으로 초반 혼잡을 만들지
+        // 않도록). 좋으면 회복 로직이 곧 ceiling 까지 올린다.
+        let start = ((ceiling / 2).max(floor)).min(ceiling);
         self.max.store(ceiling, Ordering::Release);
         self.min.store(floor, Ordering::Release);
-        self.target.store(ceiling, Ordering::Release);
+        self.target.store(start, Ordering::Release);
         let mut t = self.timing.lock();
         // 타이머는 과거로 초기화 — 스트림 시작 직후 첫 손실이 스로틀에 막히지 않도록.
         t.last_loss = None;
         t.last_decrease = stale_instant();
-        t.last_recover = stale_instant();
+        t.last_recover = Instant::now();
         self.loss_ewma_ppm.store(0, Ordering::Release);
     }
 
@@ -165,9 +170,10 @@ impl BitrateController {
         next
     }
 
-    /// 현재 목표 FEC parity 백분율(20~50). EWMA 손실률에 비례해 선형 상향.
-    /// 손실이 마지막으로 관측된 지 오래면 EWMA 를 시간 기반으로 감쇠시켜 FEC 를 하한으로 되돌린다
-    /// (무손실 신호는 안 오므로 여기서 능동 감쇠). 비디오 송출 루프가 프레임마다 호출한다.
+    /// 현재 목표 FEC parity 백분율(15~25). EWMA 손실률에 비례하되, **혼잡 인지**:
+    /// 비트레이트가 floor 근처(대역폭 여유 없음)면 FEC 를 하한으로 억제한다 — 이 경우 손실은
+    /// 랜덤이 아니라 혼잡 때문이라 parity 증가는 전송량만 늘려 악화시킨다(측정으로 확인).
+    /// FEC 는 "대역폭 여유가 있는데 랜덤 손실이 있을 때"만 올린다. 프레임마다 호출.
     pub fn poll_fec_percentage(&self) -> u32 {
         // 시간 기반 감쇠: 마지막 손실 이후 경과에 따라 EWMA 를 지수 감쇠(반감기 ~2s).
         let since_loss_ms = {
@@ -176,12 +182,18 @@ impl BitrateController {
         };
         let mut ewma = self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6;
         if since_loss_ms > 500 && ewma > 0.0 {
-            // 반감기 2000ms: factor = 0.5^(dt/2000). 마지막 손실 기준으로 계산.
             let decay = 0.5_f64.powf(since_loss_ms as f64 / 2000.0);
             ewma *= decay;
             self.loss_ewma_ppm.store((ewma * 1e6) as u32, Ordering::Release);
         }
-        // EWMA 0 → FEC_MIN, EWMA≥saturation → FEC_MAX, 사이는 선형.
+        // 혼잡 게이트: target 이 floor 의 1.5배 이하(=대역폭 여유 거의 없음)면 FEC 최소.
+        // 이때 손실은 혼잡 신호이므로 비트레이트 하향(poll_target)에 맡기고 parity 는 안 늘린다.
+        let target = self.target.load(Ordering::Acquire);
+        let min = self.min.load(Ordering::Acquire);
+        if min == 0 || target <= min * 3 / 2 {
+            return FEC_MIN_PCT;
+        }
+        // 여유가 있을 때만: EWMA 0 → FEC_MIN, EWMA≥saturation → FEC_MAX, 사이는 선형.
         let frac = (ewma / FEC_SATURATION_LOSS).clamp(0.0, 1.0);
         FEC_MIN_PCT + ((FEC_MAX_PCT - FEC_MIN_PCT) as f64 * frac) as u32
     }
@@ -218,42 +230,42 @@ mod tests {
     }
 
     #[test]
-    fn configure_starts_at_ceiling() {
+    fn configure_starts_at_half_ceiling() {
         let c = BitrateController::default();
         c.configure(20_000_000);
-        assert_eq!(c.poll_target(), 20_000_000);
+        // 시작은 ceiling 의 절반(초반 과전송 방지).
+        assert_eq!(c.poll_target(), 10_000_000);
     }
 
     #[test]
     fn loss_decreases_multiplicatively() {
         let c = BitrateController::default();
-        c.configure(20_000_000);
-        c.on_loss(0.1); // 기본 0.6 → 12M
-        assert_eq!(c.poll_target(), 12_000_000);
+        c.configure(20_000_000); // start 10M
+        c.on_loss(0.1); // 기본 0.6 → 6M
+        assert_eq!(c.poll_target(), 6_000_000);
     }
 
     #[test]
     fn severe_loss_drops_harder() {
         let c = BitrateController::default();
-        c.configure(20_000_000);
-        c.on_loss(0.5); // 0.5 factor → 10M
-        assert_eq!(c.poll_target(), 10_000_000);
+        c.configure(20_000_000); // start 10M
+        c.on_loss(0.5); // 0.5 factor → 5M
+        assert_eq!(c.poll_target(), 5_000_000);
     }
 
     #[test]
     fn decrease_is_throttled() {
         let c = BitrateController::default();
-        c.configure(20_000_000);
-        c.on_loss(0.1); // 20M → 12M
+        c.configure(20_000_000); // start 10M
+        c.on_loss(0.1); // 10M → 6M
         c.on_loss(0.1); // 스로틀 내 → 변화 없음
-        assert_eq!(c.poll_target(), 12_000_000);
+        assert_eq!(c.poll_target(), 6_000_000);
     }
 
     #[test]
     fn floor_is_respected() {
         let c = BitrateController::default();
-        c.configure(4_000_000); // floor = 500k
-        // 여러 번 강제로 낮추되 스로틀 우회를 위해 타이밍 조작.
+        c.configure(4_000_000); // floor = 1M (절대 하한)
         for _ in 0..20 {
             {
                 let mut t = c.timing.lock();
@@ -261,15 +273,15 @@ mod tests {
             }
             c.on_loss(0.5);
         }
-        assert_eq!(c.poll_target(), 500_000);
+        assert_eq!(c.poll_target(), 1_000_000);
     }
 
     #[test]
     fn recovery_increases_after_delay() {
         let c = BitrateController::default();
-        c.configure(20_000_000);
-        c.on_loss(0.1); // → 12M
-        assert_eq!(c.poll_target(), 12_000_000);
+        c.configure(20_000_000); // start 10M
+        c.on_loss(0.1); // → 6M
+        assert_eq!(c.poll_target(), 6_000_000);
         // 손실/회복 타이밍을 과거로 밀어 회복 조건 충족.
         {
             let mut t = c.timing.lock();
@@ -278,9 +290,9 @@ mod tests {
             t.last_recover = past;
         }
         let after = c.poll_target();
-        assert!(after > 12_000_000, "expected recovery increase, got {after}");
-        // 스텝 = max*0.05 = 1M → 13M.
-        assert_eq!(after, 13_000_000);
+        assert!(after > 6_000_000, "expected recovery increase, got {after}");
+        // 스텝 = max*0.05 = 1M → 7M.
+        assert_eq!(after, 7_000_000);
     }
 
     #[test]
@@ -308,35 +320,48 @@ mod tests {
     }
 
     #[test]
-    fn fec_rises_under_sustained_loss() {
+    fn fec_rises_under_loss_with_headroom() {
         let c = BitrateController::default();
-        c.configure(20_000_000);
-        // 심한 손실을 여러 번 먹여 EWMA 를 saturation 이상으로 올린다.
-        for _ in 0..10 {
-            c.on_loss(0.5);
+        c.configure(20_000_000); // floor 1M
+        // headroom 을 명시적으로 보장: target 을 ceiling 으로 고정(게이트 통과 조건).
+        c.target.store(20_000_000, Ordering::Release);
+        // EWMA 를 직접 saturation 이상으로 올린다(손실 관측 시각도 최신으로).
+        c.loss_ewma_ppm.store((0.20 * 1e6) as u32, Ordering::Release);
+        {
+            let mut t = c.timing.lock();
+            t.last_loss = Some(Instant::now());
         }
         let fec = c.poll_fec_percentage();
-        assert!(fec > FEC_MIN_PCT, "expected FEC above min under loss, got {fec}");
+        assert!(fec > FEC_MIN_PCT, "expected FEC above min with headroom+loss, got {fec}");
         assert!(fec <= FEC_MAX_PCT, "FEC must not exceed max, got {fec}");
     }
 
     #[test]
-    fn fec_saturates_at_max() {
+    fn fec_suppressed_at_floor_congestion() {
         let c = BitrateController::default();
         c.configure(20_000_000);
-        // 손실 1.0 을 반복 → EWMA → 1.0 >> saturation(0.3) → FEC_MAX.
-        for _ in 0..30 {
-            c.on_loss(1.0);
+        // 심한 손실 반복 → 비트레이트가 floor(1M)까지 떨어짐 = 혼잡 상황.
+        for _ in 0..20 {
+            {
+                let mut t = c.timing.lock();
+                t.last_decrease = Instant::now() - std::time::Duration::from_secs(10);
+            }
+            c.on_loss(0.9);
         }
-        assert_eq!(c.poll_fec_percentage(), FEC_MAX_PCT);
+        // 혼잡(floor 근처)에선 손실이 심해도 FEC 를 올리지 않는다 — parity 증가는 악화만 시킴.
+        assert_eq!(c.poll_fec_percentage(), FEC_MIN_PCT);
     }
 
     #[test]
     fn fec_decays_after_loss_stops() {
         let c = BitrateController::default();
         c.configure(20_000_000);
-        for _ in 0..30 {
-            c.on_loss(1.0);
+        // headroom 고정 + EWMA saturation → FEC_MAX.
+        c.target.store(20_000_000, Ordering::Release);
+        c.loss_ewma_ppm.store((0.20 * 1e6) as u32, Ordering::Release);
+        {
+            let mut t = c.timing.lock();
+            t.last_loss = Some(Instant::now());
         }
         assert_eq!(c.poll_fec_percentage(), FEC_MAX_PCT);
         // 손실을 과거로 밀어 시간 감쇠가 작동하게 한다(반감기 2s → 10s 후 거의 0).

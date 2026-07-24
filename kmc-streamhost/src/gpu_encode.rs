@@ -325,7 +325,13 @@ impl ZeroCopyEncoder {
     /// 새 인코더의 첫 프레임은 자동으로 IDR 이라 시각적 글리치 없이 전환된다.
     /// 실패 시 기존 인코더를 유지하고 Err 을 반환(스트림 계속).
     pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
-        if bitrate_bps == self.bitrate {
+        // 히스테리시스: 변화가 20% 미만이면 재생성하지 않는다. 인코더 재생성마다 IDR 키프레임이
+        // 생겨(수십~수백 KB) 혼잡 회선에 부담 → 비트레이트가 자잘하게 튈 때 IDR 폭풍을 막는다.
+        // 단, floor 근처(1.2Mbps 이하)로 내려가는 하향은 항상 반영(혼잡 탈출이 급하므로).
+        let cur = self.bitrate;
+        let changed_enough = bitrate_bps.abs_diff(cur) * 100 >= cur * 20;
+        let urgent_down = bitrate_bps < cur && bitrate_bps <= 1_200_000;
+        if !changed_enough && !urgent_down {
             return Ok(());
         }
         unsafe {

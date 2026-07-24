@@ -94,7 +94,12 @@ impl QsvEncoder {
     /// 목표 비트레이트로 인코더를 재생성한다(QSV 런타임 재구성 불안정 → 컨텍스트 재생성).
     /// 새 인코더 첫 프레임은 IDR 이라 매끄럽게 전환. 실패 시 기존 인코더 유지 + Err.
     pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
-        if bitrate_bps == self.bitrate {
+        // 히스테리시스(zero-copy 와 동일): 20% 미만 변화는 무시해 IDR 폭풍 방지. floor 근처
+        // 하향은 항상 반영(혼잡 탈출 우선).
+        let cur = self.bitrate;
+        let changed_enough = bitrate_bps.abs_diff(cur) * 100 >= cur * 20;
+        let urgent_down = bitrate_bps < cur && bitrate_bps <= 1_200_000;
+        if !changed_enough && !urgent_down {
             return Ok(());
         }
         let new_enc = Self::build_encoder(&self.codec_name, self.width, self.height, self.fps, bitrate_bps)?;
