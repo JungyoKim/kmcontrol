@@ -31,8 +31,8 @@ const RECOVER_INTERVAL_MS: u128 = 2000;
 const RECOVER_STEP_FRAC: f64 = 0.03;
 /// 이 EWMA 손실률 이상이면 회복(증가)을 아예 보류한다 — 잔여 손실이 있으면 올리지 않는다.
 const RECOVER_LOSS_GATE: f64 = 0.02;
-/// 손실 없이 이만큼 지나면 학습 상한을 재탐색(느린 상향). 회선 회복 가능성 대비.
-const REPROBE_AFTER_MS: u128 = 8000;
+/// 손실 없이 이만큼 지나면 학습 상한을 재탐색(느린 상향). 30s 로 길게 — 자주 한계를 안 건드리게.
+const REPROBE_AFTER_MS: u128 = 30000;
 /// FEC parity 하한(%): 무손실~경미 손실 시. Moonlight 기본보다 약간 낮춰 평상시 전송량 절감.
 const FEC_MIN_PCT: u32 = 15;
 /// FEC parity 상한(%): 경미한 랜덤 손실 복구용. 혼잡 회선에선 FEC 증가가 오히려 독이므로
@@ -72,6 +72,10 @@ pub struct BitrateController {
     /// 학습된 안전 상한(bps): 손실로 붕괴한 지점 기록. 회복은 이 값을 넘지 않아 톱니파를 막는다.
     /// 손실 없이 오래 안정되면 서서히 상향(회선이 좋아졌을 수도 있으므로 재탐색).
     learned_ceiling: AtomicU32,
+    /// 재탐색 상한(bps): 관측된 붕괴 지점들의 상한. reprobe 가 learned_ceiling 을 이 값 위로는
+    /// 못 올린다 — 5M 회선에서 20M 까지 무한 상승하던 톱니파를 막는다. 초기엔 max(제약 없음),
+    /// 손실 붕괴 시 붕괴 지점의 1.2배로 낮아진다(그 이상은 또 무너질 게 뻔하므로 탐색 안 함).
+    probe_cap: AtomicU32,
 }
 
 impl BitrateController {
@@ -88,6 +92,7 @@ impl BitrateController {
             }),
             loss_ewma_ppm: AtomicU32::new(0),
             learned_ceiling: AtomicU32::new(0),
+            probe_cap: AtomicU32::new(0),
         })
     }
 
@@ -96,9 +101,9 @@ impl BitrateController {
         // floor 는 절대 하한(1Mbps) — ceiling/8 은 고대역 협상 시 6M+ 로 과도해져 혼잡 회선에서
         // 못 내려가는 문제가 있었다. 셀룰러/핫스팟이 감당할 최저치까지 내려가게 한다.
         let floor = 1_000_000u32.min(ceiling);
-        // 시작 목표는 ceiling 이 아니라 중간값(가용 대역 모를 때 과도 전송으로 초반 혼잡을 만들지
-        // 않도록). 좋으면 회복 로직이 곧 ceiling 까지 올린다.
-        let start = ((ceiling / 2).max(floor)).min(ceiling);
+        // 시작 목표는 보수적으로(3Mbps 또는 ceiling/4 중 작은 값). ceiling/2 는 초반에 회선 용량을
+        // 모른 채 과전송해 큰 손실 붕괴(16M→5M 같은)를 유발했다. 낮게 시작해 회복 로직이 천천히 올린다.
+        let start = 3_000_000u32.min(ceiling / 4).max(floor).min(ceiling);
         self.max.store(ceiling, Ordering::Release);
         self.min.store(floor, Ordering::Release);
         self.target.store(start, Ordering::Release);
@@ -108,8 +113,9 @@ impl BitrateController {
         t.last_decrease = stale_instant();
         t.last_recover = Instant::now();
         self.loss_ewma_ppm.store(0, Ordering::Release);
-        // 학습 상한을 ceiling 으로 초기화(아직 실패 미관측 → 전체 대역 탐색 허용).
+        // 학습 상한/재탐색 상한을 ceiling 으로 초기화(아직 실패 미관측 → 전체 대역 탐색 허용).
         self.learned_ceiling.store(ceiling, Ordering::Release);
+        self.probe_cap.store(ceiling, Ordering::Release);
     }
 
     /// 손실 신호(FEC status 도착). `loss_fraction` = 0.0~1.0(수신 실패 패킷 비율).
@@ -148,10 +154,16 @@ impl BitrateController {
         // 그 85% 를 안전 상한으로 기록(하향 래칫만 — 더 낮은 실패점만 반영). 회복이 이 위로
         // 다시 올라가 또 무너지는 톱니파를 막는다. floor 밑으로는 안 내림.
         if loss_fraction >= 0.10 {
-            let collapse = (cur as f64 * 0.85) as u32;
+            // 0.70: 실패 지점의 70% 로 안전 상한 설정(여유 크게). 85% 는 회선 한계에 너무 붙어
+            // 지속 손실→마우스 잔상(부분 프레임)을 유발했다. 여유를 둬 손실 없는 대역에서 안정.
+            let collapse = (cur as f64 * 0.70) as u32;
             let prev_lc = self.learned_ceiling.load(Ordering::Acquire);
             let new_lc = collapse.max(min).min(prev_lc);
             self.learned_ceiling.store(new_lc, Ordering::Release);
+            // 재탐색 상한도 낮춘다: 붕괴 지점(cur)의 1.2배까지만 이후 탐색 허용. 이래야 reprobe 가
+            // 5M 회선에서 20M 까지 무한히 기어올라 또 무너지는 것(톱니파)을 근본적으로 막는다.
+            let new_pc = ((cur as f64 * 1.2) as u32).max(new_lc).min(self.probe_cap.load(Ordering::Acquire));
+            self.probe_cap.store(new_pc, Ordering::Release);
         }
         tracing::info!(
             loss = loss_fraction,
@@ -185,10 +197,11 @@ impl BitrateController {
             return cur;
         }
         // 재탐색: 손실 없이 오래(REPROBE_AFTER) 안정되면 학습 상한을 조금씩 올린다(회선이
-        // 좋아졌을 수 있으므로). 상시가 아니라 아주 느리게 — 톱니파 재발 방지.
+        // 좋아졌을 수 있으므로). 단, probe_cap(붕괴 지점 기반) 을 넘지 않는다 — 무한 상승 금지.
+        let probe_cap = self.probe_cap.load(Ordering::Acquire);
         let mut lc = self.learned_ceiling.load(Ordering::Acquire);
-        if lc < max && since_loss >= REPROBE_AFTER_MS {
-            lc = ((lc as f64 * 1.05) as u32).min(max);
+        if lc < probe_cap && since_loss >= REPROBE_AFTER_MS {
+            lc = ((lc as f64 * 1.02) as u32).min(probe_cap);
             self.learned_ceiling.store(lc, Ordering::Release);
         }
         // 회복 상한 = 학습된 안전 상한(협상 max 가 아니라). 여기서 멈춰 톱니파를 막는다.
@@ -248,6 +261,7 @@ impl Default for BitrateController {
             }),
             loss_ewma_ppm: AtomicU32::new(0),
             learned_ceiling: AtomicU32::new(0),
+            probe_cap: AtomicU32::new(0),
         }
     }
 }
@@ -265,17 +279,18 @@ mod tests {
     }
 
     #[test]
-    fn configure_starts_at_half_ceiling() {
+    fn configure_starts_conservative() {
         let c = BitrateController::default();
         c.configure(20_000_000);
-        // 시작은 ceiling 의 절반(초반 과전송 방지).
-        assert_eq!(c.poll_target(), 10_000_000);
+        // 시작은 보수적으로 min(3M, ceiling/4) = 3M (초반 과전송 붕괴 방지).
+        assert_eq!(c.poll_target(), 3_000_000);
     }
 
     #[test]
     fn loss_decreases_multiplicatively() {
         let c = BitrateController::default();
-        c.configure(20_000_000); // start 10M
+        c.configure(20_000_000);
+        c.target.store(10_000_000, Ordering::Release); // 감소 계약을 결정적으로 테스트
         c.on_loss(0.1); // 기본 0.6 → 6M
         assert_eq!(c.poll_target(), 6_000_000);
     }
@@ -283,7 +298,8 @@ mod tests {
     #[test]
     fn severe_loss_drops_harder() {
         let c = BitrateController::default();
-        c.configure(20_000_000); // start 10M
+        c.configure(20_000_000);
+        c.target.store(10_000_000, Ordering::Release);
         c.on_loss(0.5); // 0.5 factor → 5M
         assert_eq!(c.poll_target(), 5_000_000);
     }
@@ -291,7 +307,8 @@ mod tests {
     #[test]
     fn decrease_is_throttled() {
         let c = BitrateController::default();
-        c.configure(20_000_000); // start 10M
+        c.configure(20_000_000);
+        c.target.store(10_000_000, Ordering::Release);
         c.on_loss(0.1); // 10M → 6M
         c.on_loss(0.1); // 스로틀 내 → 변화 없음
         assert_eq!(c.poll_target(), 6_000_000);
@@ -314,10 +331,10 @@ mod tests {
     #[test]
     fn recovery_increases_after_delay() {
         let c = BitrateController::default();
-        c.configure(20_000_000); // start 10M
+        c.configure(20_000_000);
+        c.target.store(10_000_000, Ordering::Release);
         c.on_loss(0.1); // → 6M
         assert_eq!(c.poll_target(), 6_000_000);
-        // 손실/회복 타이밍을 충분히 과거로(>RECOVER_DELAY 5s) + 잔여 손실 EWMA 제거(게이트 통과).
         {
             let mut t = c.timing.lock();
             let past = Instant::now() - std::time::Duration::from_secs(10);
@@ -333,13 +350,14 @@ mod tests {
 
     #[test]
     fn recovery_caps_at_ceiling() {
+        // 손실이 전혀 없으면(probe_cap=ceiling 유지) reprobe 로 ceiling 까지 회복 가능.
         let c = BitrateController::default();
         c.configure(20_000_000);
-        c.on_loss(0.5); // → 5M
-        for _ in 0..200 {
+        c.target.store(5_000_000, Ordering::Release);
+        for _ in 0..400 {
             {
                 let mut t = c.timing.lock();
-                let past = Instant::now() - std::time::Duration::from_secs(10);
+                let past = Instant::now() - std::time::Duration::from_secs(40);
                 t.last_loss = Some(past);
                 t.last_recover = past;
             }
@@ -355,10 +373,10 @@ mod tests {
         c.configure(20_000_000); // start 10M, learned_ceiling 20M
         // 8M 부근에서 손실 붕괴 시뮬레이션: target 을 8M 로 두고 큰 손실.
         c.target.store(8_000_000, Ordering::Release);
-        c.on_loss(0.4); // learned_ceiling → min(20M, 8M*0.85=6.8M) = 6.8M
-        assert_eq!(c.learned_ceiling.load(Ordering::Acquire), 6_800_000);
-        // 손실 없이 회복시켜도 학습 상한(6.8M) 근처에서 멈춰야 한다(20M 로 안 올라감).
-        // reprobe 는 8s 후에만 — 여기선 손실 후 6s 로 유지해 reprobe 억제.
+        c.on_loss(0.4); // learned_ceiling → min(20M, 8M*0.70=5.6M) = 5.6M
+        assert_eq!(c.learned_ceiling.load(Ordering::Acquire), 5_600_000);
+        // 손실 없이 회복시켜도 학습 상한(5.6M) 근처에서 멈춘다(20M 로 안 올라감).
+        // last_loss 를 6s 로 유지: RECOVER_DELAY(5s) 는 넘되 REPROBE(15s) 는 안 넘겨 재탐색 억제.
         for _ in 0..50 {
             {
                 let mut t = c.timing.lock();
@@ -370,8 +388,8 @@ mod tests {
             c.poll_target();
         }
         let settled = c.poll_target();
-        assert!(settled <= 6_800_000, "recovery must cap at learned ceiling, got {settled}");
-        assert!(settled >= 6_000_000, "should recover up to near learned ceiling, got {settled}");
+        assert!(settled <= 5_600_000, "recovery must cap at learned ceiling, got {settled}");
+        assert!(settled >= 5_000_000, "should recover up to near learned ceiling, got {settled}");
     }
 
     #[test]
