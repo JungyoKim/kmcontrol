@@ -95,8 +95,10 @@ pub fn packetize_frame(
     sequence_number: &mut u32,
     stream_packet_index: &mut u32,
     rtp_timestamp: u32,
+    fec_percentage: usize,
 ) -> Vec<Vec<u8>> {
-    const FEC_PERCENTAGE: usize = 20;
+    // 동적 FEC: 호출자(비디오 루프)가 손실률 기반 목표 parity% 를 전달. 안전 범위로 클램프.
+    let fec_percentage = fec_percentage.clamp(10, 60);
     const MAX_SHARDS: usize = 255;
 
     let shard_payload_size = requested_packet_size - NV_VIDEO_PACKET_SIZE;
@@ -114,7 +116,7 @@ pub fn packetize_frame(
     let shard_size = PAYLOAD_OFFSET + shard_payload_size;
 
     // FEC 블록 분할 (moonshine/Sunshine): 블록당 데이터 shard 상한으로 4K 등 큰 프레임 대응.
-    let nr_parity_per_block = MAX_SHARDS * FEC_PERCENTAGE / (100 + FEC_PERCENTAGE);
+    let nr_parity_per_block = MAX_SHARDS * fec_percentage / (100 + fec_percentage);
     let nr_data_per_block = MAX_SHARDS - nr_parity_per_block;
     // 최대 4블록 (multi_fec_blocks 2비트). 초과분은 마지막 블록에 몰아 FEC 없이.
     let nr_blocks = ((total_data_shards - 1) / nr_data_per_block + 1).min(4);
@@ -135,9 +137,9 @@ pub fn packetize_frame(
             break;
         }
 
-        let nr_parity = ((block_data_shards * FEC_PERCENTAGE / 100).max(1))
+        let nr_parity = ((block_data_shards * fec_percentage / 100).max(1))
             .min(MAX_SHARDS.saturating_sub(block_data_shards));
-        let fec_percentage = nr_parity * 100 / block_data_shards;
+        let achieved_fec_pct = nr_parity * 100 / block_data_shards;
         let block_total = block_data_shards + nr_parity;
         let multi_fec_blocks: u8 = ((block_index as u8) << 4) | last_block_index;
 
@@ -164,7 +166,7 @@ pub fn packetize_frame(
             if global_data_index == total_data_shards - 1 {
                 flags |= RtpFlag::EndOfFrame as u8;
             }
-            let fec_info = (i << 12 | block_data_shards << 22 | fec_percentage << 4) as u32;
+            let fec_info = (i << 12 | block_data_shards << 22 | achieved_fec_pct << 4) as u32;
             // streamPacketIndex는 데이터 패킷만 세는 전역 카운터 (parity 제외 후 연속성 요구).
             let spi = *stream_packet_index;
             *stream_packet_index = stream_packet_index.wrapping_add(1);
@@ -209,7 +211,7 @@ pub fn packetize_frame(
             let nv = &mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE];
             nv[4..8].copy_from_slice(&frame_number.to_le_bytes());
             nv[11] = multi_fec_blocks;
-            let fec_info = (block_shard_index << 12 | block_data_shards << 22 | fec_percentage << 4) as u32;
+            let fec_info = (block_shard_index << 12 | block_data_shards << 22 | achieved_fec_pct << 4) as u32;
             nv[12..16].copy_from_slice(&fec_info.to_le_bytes());
         }
 
@@ -227,7 +229,7 @@ mod tests {
     // 테스트 헬퍼: SPI 카운터를 함께 전달.
     fn pf(data: &[u8], key: bool, psize: usize, fnum: u32, seq: &mut u32, ts: u32) -> Vec<Vec<u8>> {
         let mut spi = 0u32;
-        packetize_frame(data, key, psize, fnum, seq, &mut spi, ts)
+        packetize_frame(data, key, psize, fnum, seq, &mut spi, ts, 20)
     }
 
     #[test]
@@ -318,7 +320,7 @@ mod tests {
         let mut collected = Vec::new();
         for fnum in 1..=2u32 {
             let data = vec![0x22u8; 500]; // 256 packet_size → 3 데이터 + 1 parity
-            let shards = packetize_frame(&data, fnum == 1, 256, fnum, &mut seq, &mut spi, fnum);
+            let shards = packetize_frame(&data, fnum == 1, 256, fnum, &mut seq, &mut spi, fnum, 20);
             let nr_data = 3;
             for (i, s) in shards.iter().enumerate() {
                 if i < nr_data {

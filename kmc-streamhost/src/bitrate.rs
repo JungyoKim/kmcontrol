@@ -28,6 +28,15 @@ const RECOVER_DELAY_MS: u128 = 1500;
 const RECOVER_INTERVAL_MS: u128 = 1000;
 /// 회복 스텝 = ceiling(max) 의 이 비율만큼 매 주기 덧셈(≈20s 만에 floor→max).
 const RECOVER_STEP_FRAC: f64 = 0.05;
+/// FEC parity 하한(%): 무손실~경미 손실 시. Moonlight 기본과 동일.
+const FEC_MIN_PCT: u32 = 20;
+/// FEC parity 상한(%): 심한 손실 시. parity 를 늘려 버스트 손실을 복구한다.
+/// (셀룰러/핫스팟처럼 손실률이 FEC 복구 한계를 넘나드는 회선 대응.)
+const FEC_MAX_PCT: u32 = 50;
+/// 손실률 EWMA 평활 계수(0~1). 클수록 최근 값에 민감. 프레임당 손실은 튀므로 완만하게.
+const LOSS_EWMA_ALPHA: f64 = 0.3;
+/// 이 EWMA 손실률(0~1)에서 FEC 가 상한에 도달한다. 그 이하는 선형 보간.
+const FEC_SATURATION_LOSS: f64 = 0.30;
 
 struct Timing {
     last_loss: Option<Instant>,
@@ -51,6 +60,8 @@ pub struct BitrateController {
     /// 상한(bps) = 협상된 비트레이트(ceiling).
     max: AtomicU32,
     timing: Mutex<Timing>,
+    /// 최근 손실률 EWMA(0.0~1.0) 를 1e6 스케일 고정소수로 저장(원자적). FEC% 계산에 사용.
+    loss_ewma_ppm: AtomicU32,
 }
 
 impl BitrateController {
@@ -65,6 +76,7 @@ impl BitrateController {
                 last_decrease: now,
                 last_recover: now,
             }),
+            loss_ewma_ppm: AtomicU32::new(0),
         })
     }
 
@@ -81,20 +93,28 @@ impl BitrateController {
         t.last_loss = None;
         t.last_decrease = stale_instant();
         t.last_recover = stale_instant();
+        self.loss_ewma_ppm.store(0, Ordering::Release);
     }
 
-    /// 손실 신호(FEC status 도착). `loss_fraction` = 0.0~1.0(수신 실패 패킷 비율). 곱셈 감소.
+    /// 손실 신호(FEC status 도착). `loss_fraction` = 0.0~1.0(수신 실패 패킷 비율).
+    /// EWMA 손실률을 갱신(FEC% 계산용)하고, 스로틀 밖이면 비트레이트를 곱셈 감소한다.
     pub fn on_loss(&self, loss_fraction: f32) {
         let max = self.max.load(Ordering::Acquire);
         if max == 0 {
             return; // 미설정(협상 전).
         }
+        // EWMA 갱신은 스로틀과 무관하게 항상 수행 — FEC 는 모든 손실 신호를 반영해야 한다.
+        let lf = loss_fraction.clamp(0.0, 1.0) as f64;
+        let prev = self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6;
+        let ewma = LOSS_EWMA_ALPHA * lf + (1.0 - LOSS_EWMA_ALPHA) * prev;
+        self.loss_ewma_ppm.store((ewma * 1e6) as u32, Ordering::Release);
+
         let min = self.min.load(Ordering::Acquire);
         let mut t = self.timing.lock();
         let now = Instant::now();
         t.last_loss = Some(now);
         if now.duration_since(t.last_decrease).as_millis() < DECREASE_THROTTLE_MS {
-            return; // 버스트 스로틀 — 이미 최근에 낮췄음.
+            return; // 버스트 스로틀 — 이미 최근에 낮췄음(EWMA 는 위에서 이미 갱신).
         }
         // 손실이 심하면 더 공격적으로(0.5), 경미하면 완만하게(0.75). 기본 0.6.
         let factor = if loss_fraction >= 0.3 {
@@ -144,6 +164,27 @@ impl BitrateController {
         tracing::debug!(from = cur, to = next, "bitrate: recover → increase");
         next
     }
+
+    /// 현재 목표 FEC parity 백분율(20~50). EWMA 손실률에 비례해 선형 상향.
+    /// 손실이 마지막으로 관측된 지 오래면 EWMA 를 시간 기반으로 감쇠시켜 FEC 를 하한으로 되돌린다
+    /// (무손실 신호는 안 오므로 여기서 능동 감쇠). 비디오 송출 루프가 프레임마다 호출한다.
+    pub fn poll_fec_percentage(&self) -> u32 {
+        // 시간 기반 감쇠: 마지막 손실 이후 경과에 따라 EWMA 를 지수 감쇠(반감기 ~2s).
+        let since_loss_ms = {
+            let t = self.timing.lock();
+            t.last_loss.map_or(u128::MAX, |l| Instant::now().duration_since(l).as_millis())
+        };
+        let mut ewma = self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6;
+        if since_loss_ms > 500 && ewma > 0.0 {
+            // 반감기 2000ms: factor = 0.5^(dt/2000). 마지막 손실 기준으로 계산.
+            let decay = 0.5_f64.powf(since_loss_ms as f64 / 2000.0);
+            ewma *= decay;
+            self.loss_ewma_ppm.store((ewma * 1e6) as u32, Ordering::Release);
+        }
+        // EWMA 0 → FEC_MIN, EWMA≥saturation → FEC_MAX, 사이는 선형.
+        let frac = (ewma / FEC_SATURATION_LOSS).clamp(0.0, 1.0);
+        FEC_MIN_PCT + ((FEC_MAX_PCT - FEC_MIN_PCT) as f64 * frac) as u32
+    }
 }
 
 impl Default for BitrateController {
@@ -159,6 +200,7 @@ impl Default for BitrateController {
                 last_decrease: now,
                 last_recover: now,
             }),
+            loss_ewma_ppm: AtomicU32::new(0),
         }
     }
 }
@@ -256,5 +298,60 @@ mod tests {
             c.poll_target();
         }
         assert_eq!(c.poll_target(), 20_000_000);
+    }
+
+    #[test]
+    fn fec_default_is_min_when_clean() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        assert_eq!(c.poll_fec_percentage(), FEC_MIN_PCT);
+    }
+
+    #[test]
+    fn fec_rises_under_sustained_loss() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        // 심한 손실을 여러 번 먹여 EWMA 를 saturation 이상으로 올린다.
+        for _ in 0..10 {
+            c.on_loss(0.5);
+        }
+        let fec = c.poll_fec_percentage();
+        assert!(fec > FEC_MIN_PCT, "expected FEC above min under loss, got {fec}");
+        assert!(fec <= FEC_MAX_PCT, "FEC must not exceed max, got {fec}");
+    }
+
+    #[test]
+    fn fec_saturates_at_max() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        // 손실 1.0 을 반복 → EWMA → 1.0 >> saturation(0.3) → FEC_MAX.
+        for _ in 0..30 {
+            c.on_loss(1.0);
+        }
+        assert_eq!(c.poll_fec_percentage(), FEC_MAX_PCT);
+    }
+
+    #[test]
+    fn fec_decays_after_loss_stops() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        for _ in 0..30 {
+            c.on_loss(1.0);
+        }
+        assert_eq!(c.poll_fec_percentage(), FEC_MAX_PCT);
+        // 손실을 과거로 밀어 시간 감쇠가 작동하게 한다(반감기 2s → 10s 후 거의 0).
+        {
+            let mut t = c.timing.lock();
+            t.last_loss = Some(Instant::now() - std::time::Duration::from_secs(10));
+        }
+        let fec = c.poll_fec_percentage();
+        assert!(fec < FEC_MAX_PCT, "FEC should decay after loss stops, got {fec}");
+    }
+
+    #[test]
+    fn fec_unconfigured_returns_min() {
+        let c = BitrateController::default();
+        // 미설정이어도 안전한 하한을 반환(패킷타이저가 항상 유효 값을 받도록).
+        assert_eq!(c.poll_fec_percentage(), FEC_MIN_PCT);
     }
 }

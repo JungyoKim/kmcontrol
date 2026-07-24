@@ -23,7 +23,7 @@ pub struct EncodedFrame {
 pub type FrameSender = mpsc::Sender<EncodedFrame>;
 
 /// 비디오 UDP 스트림을 spawn하고 프레임 sender를 반환.
-pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: std::sync::Arc<std::sync::atomic::AtomicBool>, client_active: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<FrameSender> {
+pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: std::sync::Arc<std::sync::atomic::AtomicBool>, client_active: std::sync::Arc<std::sync::atomic::AtomicBool>, bitrate: std::sync::Arc<crate::bitrate::BitrateController>) -> Result<FrameSender> {
     let addr: SocketAddr = format!("{bind_ip}:{port}").parse().context("parse video addr")?;
     let socket = UdpSocket::bind(addr).await.context("bind video udp")?;
     // 송신 버퍼 확대: 4K 키프레임(수백 shard) 버스트 유실 방지 (Sunshine도 큰 SO_SNDBUF 사용).
@@ -116,6 +116,8 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                         stream_packet_index = 0;
                     }
                     frame_number += 1;
+                    // 동적 FEC: 최근 손실률 기반 목표 parity%(20~50) 를 프레임마다 적용.
+                    let fec_pct = bitrate.poll_fec_percentage() as usize;
                     let shards = packetizer::packetize_frame(
                         &frame.data,
                         frame.is_key_frame,
@@ -124,6 +126,7 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                         &mut sequence_number,
                         &mut stream_packet_index,
                         frame.rtp_timestamp,
+                        fec_pct,
                     );
                     // 버스트 유실 방지: shard를 배치로 나눠 송신하고 배치 사이에 짧게 양보.
                     // (Sunshine의 send_batch_size ~64KB 페이싱을 모사.)
@@ -139,9 +142,9 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                         }
                     }
                     if frame_number % 60 == 1 {
-                        tracing::info!(frame_number, shards = shards.len(), "video frames flowing");
+                        tracing::info!(frame_number, shards = shards.len(), fec_pct, "video frames flowing");
                     } else {
-                        tracing::trace!(frame_number, shards = shards.len(), "video frame sent");
+                        tracing::trace!(frame_number, shards = shards.len(), fec_pct, "video frame sent");
                     }
                 }
 

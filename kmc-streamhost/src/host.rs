@@ -133,7 +133,7 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
 
             // 첫 PLAY: UDP 송출 소켓을 1회 bind.
             let packet_size = if ctx.packet_size == 0 { 1024 } else { ctx.packet_size as usize };
-            let sender = match crate::video::start(&bind_ip, video_port, packet_size, session_reset.clone(), client_active.clone()).await {
+            let sender = match crate::video::start(&bind_ip, video_port, packet_size, session_reset.clone(), client_active.clone(), bitrate_ctl.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(error=%e, "failed to start video stream");
