@@ -96,16 +96,18 @@ impl QsvEncoder {
     /// 목표 비트레이트로 인코더를 재생성한다(QSV 런타임 재구성 불안정 → 컨텍스트 재생성).
     /// 새 인코더 첫 프레임은 IDR 이라 매끄럽게 전환. 실패 시 기존 인코더 유지 + Err.
     pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
-        // 히스테리시스(zero-copy 와 동일): 20% 미만 변화는 무시해 IDR 폭풍 방지. floor 근처
-        // 하향은 항상 반영(혼잡 탈출 우선).
+        // 방향별 재구성 정책(zero-copy 와 동일): 하향은 민감(15%,2s)+긴급 즉시, 상향은 둔감(40%,8s)
+        // 으로 손실 없는 회복 중 IDR 남발(미세 끊김)을 막는다.
         let cur = self.bitrate;
-        let changed_enough = bitrate_bps.abs_diff(cur) * 100 >= cur * 20;
-        let urgent_down = bitrate_bps < cur && bitrate_bps <= 1_200_000;
+        let going_down = bitrate_bps < cur;
+        let urgent_down = going_down && bitrate_bps <= 1_200_000;
+        let threshold_pct = if going_down { 15 } else { 40 };
+        let changed_enough = bitrate_bps.abs_diff(cur) * 100 >= cur * threshold_pct;
         if !changed_enough && !urgent_down {
             return Ok(());
         }
-        // 재구성 rate-limit: 최소 3초 간격(zero-copy 와 동일). 긴급 하향은 예외.
-        if !urgent_down && self.last_reconfig.elapsed().as_millis() < 3000 {
+        let min_interval = if going_down { 2000 } else { 8000 };
+        if !urgent_down && self.last_reconfig.elapsed().as_millis() < min_interval {
             return Ok(());
         }
         let new_enc = Self::build_encoder(&self.codec_name, self.width, self.height, self.fps, bitrate_bps)?;

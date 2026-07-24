@@ -327,18 +327,19 @@ impl ZeroCopyEncoder {
     /// 새 인코더의 첫 프레임은 자동으로 IDR 이라 시각적 글리치 없이 전환된다.
     /// 실패 시 기존 인코더를 유지하고 Err 을 반환(스트림 계속).
     pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
-        // 히스테리시스: 변화가 20% 미만이면 재생성하지 않는다. 인코더 재생성마다 IDR 키프레임이
-        // 생겨(수십~수백 KB) 혼잡 회선에 부담 → 비트레이트가 자잘하게 튈 때 IDR 폭풍을 막는다.
-        // 단, floor 근처(1.2Mbps 이하)로 내려가는 하향은 항상 반영(혼잡 탈출이 급하므로).
+        // 재구성은 IDR 키프레임을 만들어 순간 튐(미세 끊김)을 유발하므로 최소화한다. 방향별 정책:
+        //  - 하향(손실 대응): 민감하게(15% 변화) + 긴급(floor 근처)은 즉시 — 혼잡 빨리 탈출.
+        //  - 상향(회복): 둔감하게(40% 변화 + 8s 간격) — 손실 없이 야금야금 오를 때 IDR 남발 방지.
         let cur = self.bitrate;
-        let changed_enough = bitrate_bps.abs_diff(cur) * 100 >= cur * 20;
-        let urgent_down = bitrate_bps < cur && bitrate_bps <= 1_200_000;
+        let going_down = bitrate_bps < cur;
+        let urgent_down = going_down && bitrate_bps <= 1_200_000;
+        let threshold_pct = if going_down { 15 } else { 40 };
+        let changed_enough = bitrate_bps.abs_diff(cur) * 100 >= cur * threshold_pct;
         if !changed_enough && !urgent_down {
             return Ok(());
         }
-        // 재구성 rate-limit: 최소 3초 간격. 재구성마다 IDR + 인코더 리셋이 freeze/burst 를 만드므로
-        // 비트레이트가 진동해도 인코더는 안정적으로 유지한다. 긴급 하향(urgent_down)은 예외.
-        if !urgent_down && self.last_reconfig.elapsed().as_millis() < 3000 {
+        let min_interval = if going_down { 2000 } else { 8000 };
+        if !urgent_down && self.last_reconfig.elapsed().as_millis() < min_interval {
             return Ok(());
         }
         unsafe {
