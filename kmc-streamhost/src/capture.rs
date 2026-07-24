@@ -45,6 +45,9 @@ pub struct CaptureFlags {
     pub idr_req: Arc<AtomicBool>,
     /// 캡처+인코드 스레드가 완전히 종료되면 true (세션 전환 시 이전 세션 종료 대기용).
     pub done: Arc<AtomicBool>,
+    /// 클라이언트가 현재 프레임을 수신 중인가(video PING 활성). false 면 인코딩을 건너뛰어
+    /// idle 시 CPU/GPU/배터리를 아낀다(파이프라인 리소스는 유지, 무거운 작업만 정지).
+    pub client_active: Arc<AtomicBool>,
 }
 
 /// 최신 NV12 프레임 공유 슬롯 (RAM 폴백: 캡처 → 인코더). Condvar 로 새 프레임 도착을 즉시 통지.
@@ -296,6 +299,13 @@ fn zerocopy_loop(flags: CaptureFlags, mut s: ZcState) {
         if flags.stop_rx.load(Ordering::Relaxed) {
             break;
         }
+        // 클라이언트가 없으면(아무도 스트림을 안 봄) 인코딩을 건너뛰고 절전 대기.
+        // 캡처/변환/QSV 인코딩이 idle 노트북의 CPU·GPU·배터리를 태우는 걸 막는다.
+        // 파이프라인 리소스(D3D11/QSV)는 그대로 유지하므로 재개 시 재생성 비용/크래시 없음.
+        if !flags.client_active.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
         let idr = flags.idr_req.swap(false, Ordering::Relaxed);
         match xdevice::acquire_sync(&s.mutex_b, KEY_ENCODE, 100) {
             Ok(true) => {}
@@ -496,6 +506,11 @@ fn encode_loop(flags: CaptureFlags, slot: FrameSlot) {
         if flags.stop_rx.load(Ordering::Relaxed) {
             tracing::info!("encode loop stopping");
             return;
+        }
+        // 클라이언트 없으면 인코딩 건너뛰고 절전(idle CPU/GPU/배터리 절약).
+        if !flags.client_active.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
         }
         if let Some(g) = slot.wait_new(&mut nv12, gen, max_wait) {
             gen = g;

@@ -108,12 +108,15 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
     let pipeline_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // video 송출 태스크에 세션 리셋을 알리는 플래그 (새 세션마다 프레임 카운터 리셋).
     let session_reset = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 클라이언트 수신 활성 플래그: video PING 이 있으면 true. 인코더가 idle 시 인코딩을 멈추는 데 쓴다.
+    let client_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     rtsp.set_play_hook(std::sync::Arc::new(move |ctx| {
         let bind_ip = bind_ip.clone();
         let trigger = trigger_for_hook.clone();
         let pipeline_started = pipeline_started.clone();
         let idr_req = idr_req.clone();
         let session_reset = session_reset.clone();
+        let client_active = client_active.clone();
         tokio::spawn(async move {
             // 이미 파이프라인이 살아있으면: 세션 전환 처리만 (재생성하지 않음).
             if pipeline_started.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -125,7 +128,7 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
 
             // 첫 PLAY: UDP 송출 소켓을 1회 bind.
             let packet_size = if ctx.packet_size == 0 { 1024 } else { ctx.packet_size as usize };
-            let sender = match crate::video::start(&bind_ip, video_port, packet_size, session_reset.clone()).await {
+            let sender = match crate::video::start(&bind_ip, video_port, packet_size, session_reset.clone(), client_active.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(error=%e, "failed to start video stream");
@@ -143,6 +146,7 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
 
             // StartB 이후 캡처/인코더 1회 생성 (이후 유지).
             let idr_req = idr_req.clone();
+            let client_active = client_active.clone();
             tokio::spawn(async move {
                 trigger.wait().await;
                 tracing::info!("StartB received — beginning frame emission (persistent pipeline)");
@@ -195,6 +199,7 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
                         stop_rx: stop,
                         idr_req,
                         done,
+                        client_active,
                     };
                     crate::capture::spawn_capture(flags);
                 }

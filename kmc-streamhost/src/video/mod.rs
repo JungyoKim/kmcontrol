@@ -23,7 +23,7 @@ pub struct EncodedFrame {
 pub type FrameSender = mpsc::Sender<EncodedFrame>;
 
 /// 비디오 UDP 스트림을 spawn하고 프레임 sender를 반환.
-pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<FrameSender> {
+pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: std::sync::Arc<std::sync::atomic::AtomicBool>, client_active: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<FrameSender> {
     let addr: SocketAddr = format!("{bind_ip}:{port}").parse().context("parse video addr")?;
     let socket = UdpSocket::bind(addr).await.context("bind video udp")?;
     // 송신 버퍼 확대: 4K 키프레임(수백 shard) 버스트 유실 방지 (Sunshine도 큰 SO_SNDBUF 사용).
@@ -75,6 +75,7 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                                     }
                                     client_addr = Some(addr);
                                     last_ping = std::time::Instant::now();
+                                    client_active.store(true, std::sync::atomic::Ordering::Relaxed);
                                 }
                             } else {
                                 tracing::trace!(len, %addr, "non-PING on video socket");
@@ -88,6 +89,7 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                                 if client_addr.is_some() {
                                     tracing::info!("client stopped receiving (WSAECONNRESET); pausing send until re-PING");
                                     client_addr = None;
+                                    client_active.store(false, std::sync::atomic::Ordering::Relaxed);
                                 }
                             } else {
                                 tracing::warn!(error=%e, "video recv error");
@@ -140,6 +142,16 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                         tracing::info!(frame_number, shards = shards.len(), "video frames flowing");
                     } else {
                         tracing::trace!(frame_number, shards = shards.len(), "video frame sent");
+                    }
+                }
+
+                // 주기 점검: 클라이언트가 조용히 사라져(PING 끊김, CONNRESET 없이) 있으면 인코딩 정지.
+                // Moonlight 은 PING 을 자주 보내므로 3초 무소식이면 시청 종료로 간주.
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    if client_addr.is_some() && last_ping.elapsed() > std::time::Duration::from_secs(3) {
+                        tracing::info!("no client PING for 3s; pausing encode until re-PING");
+                        client_addr = None;
+                        client_active.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
