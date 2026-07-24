@@ -48,6 +48,8 @@ pub struct CaptureFlags {
     /// 클라이언트가 현재 프레임을 수신 중인가(video PING 활성). false 면 인코딩을 건너뛰어
     /// idle 시 CPU/GPU/배터리를 아낀다(파이프라인 리소스는 유지, 무거운 작업만 정지).
     pub client_active: Arc<AtomicBool>,
+    /// 동적 비트레이트 컨트롤러(AIMD). 인코드 루프가 poll 해 목표가 바뀌면 인코더를 재구성한다.
+    pub bitrate: Arc<crate::bitrate::BitrateController>,
 }
 
 /// 최신 NV12 프레임 공유 슬롯 (RAM 폴백: 캡처 → 인코더). Condvar 로 새 프레임 도착을 즉시 통지.
@@ -306,6 +308,16 @@ fn zerocopy_loop(flags: CaptureFlags, mut s: ZcState) {
             std::thread::sleep(std::time::Duration::from_millis(100));
             continue;
         }
+        // 동적 비트레이트: 목표가 바뀌었으면 인코더를 재구성(no-op if 동일). 매 프레임 lock/poll
+        // 비용을 피해 30프레임마다 확인(~0.25s @120fps). set_bitrate 내부에서 동일값이면 즉시 반환.
+        if frames % 30 == 0 {
+            let target = flags.bitrate.poll_target();
+            if target != 0 {
+                if let Err(e) = s.encoder.set_bitrate(target) {
+                    tracing::warn!(error=%e, "zero-copy set_bitrate failed (keeping current)");
+                }
+            }
+        }
         let idr = flags.idr_req.swap(false, Ordering::Relaxed);
         match xdevice::acquire_sync(&s.mutex_b, KEY_ENCODE, 100) {
             Ok(true) => {}
@@ -511,6 +523,15 @@ fn encode_loop(flags: CaptureFlags, slot: FrameSlot) {
         if !flags.client_active.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(100));
             continue;
+        }
+        // 동적 비트레이트: 목표 변화 시 인코더 재구성(30프레임마다 확인, 동일값이면 no-op).
+        if frame_count % 30 == 0 {
+            let target = flags.bitrate.poll_target();
+            if target != 0 {
+                if let Err(e) = encoder.set_bitrate(target) {
+                    tracing::warn!(error=%e, "RAM set_bitrate failed (keeping current)");
+                }
+            }
         }
         if let Some(g) = slot.wait_new(&mut nv12, gen, max_wait) {
             gen = g;

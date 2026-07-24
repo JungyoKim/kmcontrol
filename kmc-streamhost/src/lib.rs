@@ -15,6 +15,7 @@ pub mod rtsp;
 pub mod session;
 pub mod video;
 pub mod control;
+pub mod bitrate;
 pub mod encoder;
 pub mod qsv;
 pub mod gpuconvert;

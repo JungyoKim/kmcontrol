@@ -28,6 +28,7 @@ const MSG_START_B: u16 = 0x0307;
 const MSG_REQUEST_IDR: u16 = 0x0302;
 const MSG_INVALIDATE_REF: u16 = 0x0301;
 const MSG_INPUT_DATA: u16 = 0x0206;
+const MSG_FRAME_FEC_STATUS: u16 = 0x5502; // Sunshine 확장: 손실 프레임 FEC 상태(빅엔디언).
 
 const TAG_LEN: usize = 16;
 
@@ -67,6 +68,7 @@ pub async fn start(
     session: SessionState,
     trigger: VideoTrigger,
     idr_req: Arc<AtomicBool>,
+    bitrate: Arc<crate::bitrate::BitrateController>,
 ) -> Result<()> {
     let addr = format!("{bind_ip}:{port}");
     let socket_addr = addr.parse().context("parse control addr")?;
@@ -80,12 +82,12 @@ pub async fn start(
     tracing::info!(%addr, "control (ENet) listening");
 
     tokio::spawn(async move {
-        run_loop(host, session, trigger, idr_req).await;
+        run_loop(host, session, trigger, idr_req, bitrate).await;
     });
     Ok(())
 }
 
-async fn run_loop(mut host: Host, session: SessionState, trigger: VideoTrigger, idr_req: Arc<AtomicBool>) {
+async fn run_loop(mut host: Host, session: SessionState, trigger: VideoTrigger, idr_req: Arc<AtomicBool>, bitrate: Arc<crate::bitrate::BitrateController>) {
     let mut connected_peer: Option<PeerId> = None;
 
     loop {
@@ -116,7 +118,7 @@ async fn run_loop(mut host: Host, session: SessionState, trigger: VideoTrigger, 
                 // 패킷 처리 panic 격리 — 이상 패킷이 control 채널을 죽이지 않도록.
                 let data = packet.data().to_vec();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_packet(&data, &session, &trigger, &idr_req);
+                    handle_packet(&data, &session, &trigger, &idr_req, &bitrate);
                 }));
                 if r.is_err() {
                     tracing::error!("control packet handler panicked (isolated)");
@@ -136,7 +138,7 @@ async fn run_loop(mut host: Host, session: SessionState, trigger: VideoTrigger, 
 }
 
 /// 하나의 control 패킷 처리 (필요시 복호화 후 타입 분기).
-fn handle_packet(buf: &[u8], session: &SessionState, trigger: &VideoTrigger, idr_req: &AtomicBool) {
+fn handle_packet(buf: &[u8], session: &SessionState, trigger: &VideoTrigger, idr_req: &AtomicBool, bitrate: &crate::bitrate::BitrateController) {
     let Some((msg_type, body)) = parse_header(buf) else {
         return;
     };
@@ -168,6 +170,11 @@ fn handle_packet(buf: &[u8], session: &SessionState, trigger: &VideoTrigger, idr
         MSG_INPUT_DATA => {
             crate::input::inject(&payload);
         }
+        MSG_FRAME_FEC_STATUS => {
+            if let Some(frac) = parse_fec_loss(&payload) {
+                bitrate.on_loss(frac);
+            }
+        }
         MSG_TERMINATION_EXT => {
             tracing::info!("control termination received");
         }
@@ -175,6 +182,29 @@ fn handle_packet(buf: &[u8], session: &SessionState, trigger: &VideoTrigger, idr
             tracing::trace!(msg_type = format_args!("0x{other:04x}"), "unhandled control message");
         }
     }
+}
+
+/// SS_FRAME_FEC_STATUS(빅엔디언, 21바이트) → 이 프레임의 패킷 손실 비율(0.0~1.0).
+/// 레이아웃: frameIndex(4) highestRecvSeq(2) nextContigSeq(2) missingBeforeHighest(2)
+///   totalData(2) totalParity(2) recvData(2) recvParity(2) fecPct(1) blockIdx(1) blockCount(1).
+/// 손실 비율 = (전송된 총 패킷 - 수신된 총 패킷) / 전송된 총 패킷. FEC 로 복구됐어도 손실
+/// 신호로 사용(네트워크 열화의 조기 지표). 클라는 손실이 있을 때만 이 메시지를 보낸다.
+fn parse_fec_loss(payload: &[u8]) -> Option<f32> {
+    if payload.len() < 21 {
+        return None;
+    }
+    let be16 = |o: usize| u16::from_be_bytes([payload[o], payload[o + 1]]) as u32;
+    let total_data = be16(10);
+    let total_parity = be16(12);
+    let recv_data = be16(14);
+    let recv_parity = be16(16);
+    let total = total_data + total_parity;
+    if total == 0 {
+        return None;
+    }
+    let recv = (recv_data + recv_parity).min(total);
+    let lost = total - recv;
+    Some(lost as f32 / total as f32)
 }
 
 /// control 메시지 헤더 파싱: type(u16 LE) + length(u16 LE) + body.
@@ -256,5 +286,70 @@ fn send_to_peer(host: &mut Host, peer_id: PeerId, data: &[u8]) {
         if peer.state() == PeerState::Connected {
             let _ = peer.send(0, Packet::new(data, PacketMode::ReliableSequenced));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SS_FRAME_FEC_STATUS 빌더(빅엔디언, 21바이트).
+    fn fec_status(
+        total_data: u16,
+        total_parity: u16,
+        recv_data: u16,
+        recv_parity: u16,
+    ) -> Vec<u8> {
+        let mut b = Vec::with_capacity(21);
+        b.extend(0u32.to_be_bytes()); // frameIndex
+        b.extend(0u16.to_be_bytes()); // highestReceivedSequenceNumber
+        b.extend(0u16.to_be_bytes()); // nextContiguousSequenceNumber
+        b.extend(0u16.to_be_bytes()); // missingPacketsBeforeHighestReceived
+        b.extend(total_data.to_be_bytes());
+        b.extend(total_parity.to_be_bytes());
+        b.extend(recv_data.to_be_bytes());
+        b.extend(recv_parity.to_be_bytes());
+        b.push(20); // fecPercentage
+        b.push(0); // multiFecBlockIndex
+        b.push(1); // multiFecBlockCount
+        b
+    }
+
+    #[test]
+    fn fec_loss_none_when_all_received() {
+        let p = fec_status(100, 20, 100, 20);
+        assert_eq!(parse_fec_loss(&p), Some(0.0));
+    }
+
+    #[test]
+    fn fec_loss_half() {
+        // 총 120, 수신 60 → 0.5.
+        let p = fec_status(100, 20, 50, 10);
+        assert_eq!(parse_fec_loss(&p), Some(0.5));
+    }
+
+    #[test]
+    fn fec_loss_data_only() {
+        // 총 100(parity 0), 수신 90 → 0.1.
+        let p = fec_status(100, 0, 90, 0);
+        assert_eq!(parse_fec_loss(&p), Some(0.1));
+    }
+
+    #[test]
+    fn fec_loss_rejects_short() {
+        assert_eq!(parse_fec_loss(&[0u8; 20]), None);
+    }
+
+    #[test]
+    fn fec_loss_rejects_zero_total() {
+        let p = fec_status(0, 0, 0, 0);
+        assert_eq!(parse_fec_loss(&p), None);
+    }
+
+    #[test]
+    fn fec_loss_clamps_overreport() {
+        // 수신 > 전송(비정상) 이어도 음수/overflow 없이 0.0.
+        let p = fec_status(100, 20, 200, 50);
+        assert_eq!(parse_fec_loss(&p), Some(0.0));
     }
 }

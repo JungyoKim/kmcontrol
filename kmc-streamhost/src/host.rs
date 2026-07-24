@@ -85,12 +85,15 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
     let video_trigger = crate::control::VideoTrigger::new();
     // IDR 요청 플래그 — control 채널(클라이언트 IDR 요청)과 캡처/인코더가 공유한다.
     let idr_req = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 동적 비트레이트 컨트롤러(AIMD) — control 채널(손실 신호)과 인코드 루프(목표 poll)가 공유.
+    let bitrate_ctl = crate::bitrate::BitrateController::new();
     crate::control::start(
         &config.bind_ip,
         StreamPorts::default().control,
         session.clone(),
         video_trigger.clone(),
         idr_req.clone(),
+        bitrate_ctl.clone(),
     )
     .await
     .context("start control channel")?;
@@ -110,6 +113,7 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
     let session_reset = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // 클라이언트 수신 활성 플래그: video PING 이 있으면 true. 인코더가 idle 시 인코딩을 멈추는 데 쓴다.
     let client_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bitrate_ctl_hook = bitrate_ctl.clone();
     rtsp.set_play_hook(std::sync::Arc::new(move |ctx| {
         let bind_ip = bind_ip.clone();
         let trigger = trigger_for_hook.clone();
@@ -117,6 +121,7 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
         let idr_req = idr_req.clone();
         let session_reset = session_reset.clone();
         let client_active = client_active.clone();
+        let bitrate_ctl = bitrate_ctl_hook.clone();
         tokio::spawn(async move {
             // 이미 파이프라인이 살아있으면: 세션 전환 처리만 (재생성하지 않음).
             if pipeline_started.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -177,6 +182,8 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
                 let bitrate = negotiated.max(bitrate_floor);
                 let codec = if ctx.video_format == 1 { "hevc_qsv" } else { "h264_qsv" };
                 tracing::info!(w, h, fps, bitrate, codec, "stream encoder selected (on-demand pipeline)");
+                // 협상된 비트레이트를 AIMD 상한으로 설정(손실 시 이 아래로 낮아짐, 회복 시 여기까지).
+                bitrate_ctl.configure(bitrate);
 
                 // 생명주기 감시: 클라이언트가 볼 때만 캡처+인코드 파이프라인을 띄운다.
                 // idle 이면 완전히 종료 → WGC 캡처 세션도 닫혀 노란 "캡처 중" 테두리가 사라진다.
@@ -208,6 +215,7 @@ pub async fn start(config: HostConfig) -> Result<RtspServer> {
                                 idr_req: idr_req.clone(),
                                 done: done.clone(),
                                 client_active: client_active.clone(),
+                                bitrate: bitrate_ctl.clone(),
                             };
                             tracing::info!("client watching — starting capture pipeline");
                             crate::capture::spawn_capture(flags);

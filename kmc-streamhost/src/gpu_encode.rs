@@ -78,6 +78,61 @@ pub struct ZeroCopyEncoder {
     pts: i64,
     width: u32,
     height: u32,
+    codec_name: String,
+    fps: u32,
+    bitrate: u32,
+}
+
+/// QSV 인코더 컨텍스트를 생성해 avcodec_open2 까지 완료한다. `new` 최초 생성과
+/// `set_bitrate` 재생성이 공유(중복 제거). qsv_frames 를 ref 해 hw_frames_ctx 로 설정.
+unsafe fn build_qsv_codec_ctx(
+    codec_name: &str,
+    out_w: u32,
+    out_h: u32,
+    fps: u32,
+    bitrate_bps: u32,
+    qsv_frames: *mut AVBufferRef,
+) -> Result<*mut AVCodecContext> {
+    let cname = CString::new(codec_name)?;
+    let codec = avcodec_find_encoder_by_name(cname.as_ptr());
+    if codec.is_null() {
+        bail!("{codec_name} not found");
+    }
+    let enc = avcodec_alloc_context3(codec);
+    if enc.is_null() {
+        bail!("alloc codec ctx failed");
+    }
+    (*enc).width = out_w as c_int;
+    (*enc).height = out_h as c_int;
+    (*enc).time_base = AVRational { num: 1, den: fps as c_int };
+    (*enc).framerate = AVRational { num: fps as c_int, den: 1 };
+    (*enc).pix_fmt = AV_PIX_FMT_QSV;
+    (*enc).bit_rate = bitrate_bps as i64;
+    (*enc).rc_max_rate = bitrate_bps as i64;
+    (*enc).gop_size = i32::MAX; // 무한 GOP: 온디맨드 IDR 만.
+    (*enc).max_b_frames = 0;
+    (*enc).hw_frames_ctx = av_buffer_ref(qsv_frames);
+
+    let mut opts: *mut AVDictionary = ptr::null_mut();
+    let set = |opts: &mut *mut AVDictionary, k: &str, v: &str| {
+        let ck = CString::new(k).unwrap();
+        let cv = CString::new(v).unwrap();
+        unsafe { av_dict_set(opts as *mut _, ck.as_ptr(), cv.as_ptr(), 0) };
+    };
+    set(&mut opts, "preset", "veryfast");
+    set(&mut opts, "low_delay_brc", "1");
+    set(&mut opts, "forced_idr", "1");
+    set(&mut opts, "async_depth", "1");
+    set(&mut opts, "recovery_point_sei", "0");
+
+    let ret = avcodec_open2(enc, codec, &mut opts);
+    av_dict_free(&mut opts);
+    if ret < 0 {
+        let mut e = enc;
+        avcodec_free_context(&mut e);
+        bail!("avcodec_open2({codec_name}): {ret}");
+    }
+    Ok(enc)
 }
 
 impl ZeroCopyEncoder {
@@ -145,44 +200,8 @@ impl ZeroCopyEncoder {
                 "derive qsv frames",
             )?;
 
-            // 5) 인코더 설정(raw). hw_frames_ctx = QSV frames.
-            let cname = CString::new(codec_name)?;
-            let codec = avcodec_find_encoder_by_name(cname.as_ptr());
-            if codec.is_null() {
-                bail!("{codec_name} not found");
-            }
-            let enc = avcodec_alloc_context3(codec);
-            if enc.is_null() {
-                bail!("alloc codec ctx failed");
-            }
-            (*enc).width = out_w as c_int;
-            (*enc).height = out_h as c_int;
-            (*enc).time_base = AVRational { num: 1, den: fps as c_int };
-            (*enc).framerate = AVRational { num: fps as c_int, den: 1 };
-            (*enc).pix_fmt = AV_PIX_FMT_QSV;
-            (*enc).bit_rate = bitrate_bps as i64;
-            (*enc).rc_max_rate = bitrate_bps as i64;
-            (*enc).gop_size = i32::MAX; // 무한 GOP: 온디맨드 IDR 만.
-            (*enc).max_b_frames = 0;
-            (*enc).hw_frames_ctx = av_buffer_ref(qsv_frames);
-
-            let mut opts: *mut AVDictionary = ptr::null_mut();
-            let set = |opts: &mut *mut AVDictionary, k: &str, v: &str| {
-                let ck = CString::new(k).unwrap();
-                let cv = CString::new(v).unwrap();
-                unsafe { av_dict_set(opts as *mut _, ck.as_ptr(), cv.as_ptr(), 0) };
-            };
-            set(&mut opts, "preset", "veryfast");
-            set(&mut opts, "low_delay_brc", "1");
-            set(&mut opts, "forced_idr", "1");
-            set(&mut opts, "async_depth", "1");
-            set(&mut opts, "recovery_point_sei", "0");
-
-            let ret = avcodec_open2(enc, codec, &mut opts);
-            av_dict_free(&mut opts);
-            if ret < 0 {
-                bail!("avcodec_open2({codec_name}): {ret}");
-            }
+            // 5) 인코더 컨텍스트 생성(hw_frames_ctx = QSV frames). set_bitrate 재생성과 공유.
+            let enc = build_qsv_codec_ctx(codec_name, out_w, out_h, fps, bitrate_bps, qsv_frames)?;
 
             let pkt = av_packet_alloc();
             if pkt.is_null() {
@@ -241,6 +260,9 @@ impl ZeroCopyEncoder {
                 pts: 0,
                 width: out_w,
                 height: out_h,
+                codec_name: codec_name.to_string(),
+                fps,
+                bitrate: bitrate_bps,
             })
         }
     }
@@ -296,6 +318,33 @@ impl ZeroCopyEncoder {
     pub fn encode(&mut self, nv12_tex: &ID3D11Texture2D, force_idr: bool) -> Result<Vec<EncodedPacket>> {
         self.stage(nv12_tex)?;
         self.submit(force_idr)
+    }
+
+    /// 목표 비트레이트로 인코더 컨텍스트를 재생성한다. QSV 런타임 재구성은 불안정하므로
+    /// (드라이버 크래시 다수 보고) 컨텍스트만 새로 열고 device/hwframes/ring 은 재사용한다.
+    /// 새 인코더의 첫 프레임은 자동으로 IDR 이라 시각적 글리치 없이 전환된다.
+    /// 실패 시 기존 인코더를 유지하고 Err 을 반환(스트림 계속).
+    pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
+        if bitrate_bps == self.bitrate {
+            return Ok(());
+        }
+        unsafe {
+            let new_enc = build_qsv_codec_ctx(
+                &self.codec_name,
+                self.width,
+                self.height,
+                self.fps,
+                bitrate_bps,
+                self.qsv_frames,
+            )?;
+            if !self.enc.is_null() {
+                avcodec_free_context(&mut self.enc);
+            }
+            self.enc = new_enc;
+            self.bitrate = bitrate_bps;
+        }
+        tracing::info!(bitrate_bps, "zero-copy encoder bitrate reconfigured");
+        Ok(())
     }
 }
 

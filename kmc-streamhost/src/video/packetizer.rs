@@ -1,6 +1,6 @@
 //! GameStream 비디오 프레임 → 네트워크 shard 패킷화.
 //!
-//! R3a: FEC/암호화 없이 데이터 shard만 생성. Moonlight은 parity 0을 수용한다.
+//! Reed-Solomon FEC(기본 20% parity) + multi-FEC 블록으로 패킷 손실을 복구한다(무선/인터넷 경유 대비).
 //! shard 레이아웃 (moonlight-common-c / Sunshine / moonshine 참조):
 //!   [ RTP 헤더(12) | 패딩(4) | NvVideoPacket(16) | payload(≤ packet_size-16) ]
 //! payload 스트림 = [ VideoFrameHeader(8) ++ encoded_NAL ] 을 shard 크기로 분할.

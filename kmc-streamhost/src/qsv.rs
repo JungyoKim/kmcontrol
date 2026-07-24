@@ -18,8 +18,11 @@ pub struct EncodedPacket {
 
 pub struct QsvEncoder {
     encoder: encoder::video::Encoder,
+    codec_name: String,
     width: u32,
     height: u32,
+    fps: u32,
+    bitrate: u32,
     pts: i64,
     force_idr: bool,
 }
@@ -41,7 +44,27 @@ impl QsvEncoder {
     pub fn new_codec(codec_name: &str, width: u32, height: u32, fps: u32, bitrate_bps: u32) -> Result<Self> {
         // 전역 1회 초기화(중복 무해).
         ffmpeg::init().map_err(|e| anyhow!("ffmpeg init: {e}"))?;
+        let encoder = Self::build_encoder(codec_name, width, height, fps, bitrate_bps)?;
+        Ok(Self {
+            encoder,
+            codec_name: codec_name.to_string(),
+            width,
+            height,
+            fps,
+            bitrate: bitrate_bps,
+            pts: 0,
+            force_idr: false,
+        })
+    }
 
+    /// 저지연 QSV 인코더 하나를 열어 반환한다. new_codec 최초 생성과 set_bitrate 재생성이 공유.
+    fn build_encoder(
+        codec_name: &str,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u32,
+    ) -> Result<encoder::video::Encoder> {
         let codec = encoder::find_by_name(codec_name)
             .ok_or_else(|| anyhow!("{codec_name} not found"))?;
         let ctx = codec::context::Context::new_with_codec(codec);
@@ -65,9 +88,22 @@ impl QsvEncoder {
         opts.set("async_depth", "1");     // 프레임 지연 최소화.
         opts.set("recovery_point_sei", "0");
 
-        let encoder = video.open_with(opts).map_err(|e| anyhow!("open {codec_name}: {e}"))?;
+        video.open_with(opts).map_err(|e| anyhow!("open {codec_name}: {e}"))
+    }
 
-        Ok(Self { encoder, width, height, pts: 0, force_idr: false })
+    /// 목표 비트레이트로 인코더를 재생성한다(QSV 런타임 재구성 불안정 → 컨텍스트 재생성).
+    /// 새 인코더 첫 프레임은 IDR 이라 매끄럽게 전환. 실패 시 기존 인코더 유지 + Err.
+    pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
+        if bitrate_bps == self.bitrate {
+            return Ok(());
+        }
+        let new_enc = Self::build_encoder(&self.codec_name, self.width, self.height, self.fps, bitrate_bps)?;
+        self.encoder = new_enc;
+        self.bitrate = bitrate_bps;
+        self.pts = 0;
+        self.force_idr = true;
+        tracing::info!(bitrate_bps, "RAM encoder bitrate reconfigured");
+        Ok(())
     }
 
     /// 다음 프레임을 IDR(키프레임)로 강제.
