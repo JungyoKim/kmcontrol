@@ -81,6 +81,7 @@ pub struct ZeroCopyEncoder {
     codec_name: String,
     fps: u32,
     bitrate: u32,
+    last_reconfig: std::time::Instant,
 }
 
 /// QSV 인코더 컨텍스트를 생성해 avcodec_open2 까지 완료한다. `new` 최초 생성과
@@ -263,6 +264,7 @@ impl ZeroCopyEncoder {
                 codec_name: codec_name.to_string(),
                 fps,
                 bitrate: bitrate_bps,
+                last_reconfig: std::time::Instant::now(),
             })
         }
     }
@@ -334,6 +336,11 @@ impl ZeroCopyEncoder {
         if !changed_enough && !urgent_down {
             return Ok(());
         }
+        // 재구성 rate-limit: 최소 3초 간격. 재구성마다 IDR + 인코더 리셋이 freeze/burst 를 만드므로
+        // 비트레이트가 진동해도 인코더는 안정적으로 유지한다. 긴급 하향(urgent_down)은 예외.
+        if !urgent_down && self.last_reconfig.elapsed().as_millis() < 3000 {
+            return Ok(());
+        }
         unsafe {
             let new_enc = build_qsv_codec_ctx(
                 &self.codec_name,
@@ -348,6 +355,7 @@ impl ZeroCopyEncoder {
             }
             self.enc = new_enc;
             self.bitrate = bitrate_bps;
+            self.last_reconfig = std::time::Instant::now();
         }
         tracing::info!(bitrate_bps, "zero-copy encoder bitrate reconfigured");
         Ok(())

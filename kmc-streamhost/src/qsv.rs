@@ -25,6 +25,7 @@ pub struct QsvEncoder {
     bitrate: u32,
     pts: i64,
     force_idr: bool,
+    last_reconfig: std::time::Instant,
 }
 
 impl QsvEncoder {
@@ -54,6 +55,7 @@ impl QsvEncoder {
             bitrate: bitrate_bps,
             pts: 0,
             force_idr: false,
+            last_reconfig: std::time::Instant::now(),
         })
     }
 
@@ -102,11 +104,16 @@ impl QsvEncoder {
         if !changed_enough && !urgent_down {
             return Ok(());
         }
+        // 재구성 rate-limit: 최소 3초 간격(zero-copy 와 동일). 긴급 하향은 예외.
+        if !urgent_down && self.last_reconfig.elapsed().as_millis() < 3000 {
+            return Ok(());
+        }
         let new_enc = Self::build_encoder(&self.codec_name, self.width, self.height, self.fps, bitrate_bps)?;
         self.encoder = new_enc;
         self.bitrate = bitrate_bps;
         self.pts = 0;
         self.force_idr = true;
+        self.last_reconfig = std::time::Instant::now();
         tracing::info!(bitrate_bps, "RAM encoder bitrate reconfigured");
         Ok(())
     }

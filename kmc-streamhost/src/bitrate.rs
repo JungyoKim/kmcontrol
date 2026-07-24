@@ -22,12 +22,15 @@ use parking_lot::Mutex;
 const DECREASE_FACTOR: f64 = 0.6;
 /// 감소 스로틀: 손실 프레임이 연속으로 와도 이 간격 안에서는 한 번만 낮춘다.
 const DECREASE_THROTTLE_MS: u128 = 400;
-/// 마지막 손실 이후 이만큼 지나야 회복(증가)을 시작한다.
-const RECOVER_DELAY_MS: u128 = 1500;
-/// 회복 증가 주기.
-const RECOVER_INTERVAL_MS: u128 = 1000;
-/// 회복 스텝 = ceiling(max) 의 이 비율만큼 매 주기 덧셈(≈20s 만에 floor→max).
-const RECOVER_STEP_FRAC: f64 = 0.05;
+/// 마지막 손실 이후 이만큼 지나야 회복(증가)을 시작한다. 셀룰러 진동 방지를 위해 길게(5s):
+/// 손실 직후 성급히 올리면 회선이 회복 안 된 상태에서 재손실 → 비트레이트 진동 → freeze/burst.
+const RECOVER_DELAY_MS: u128 = 5000;
+/// 회복 증가 주기(느리게).
+const RECOVER_INTERVAL_MS: u128 = 2000;
+/// 회복 스텝 = ceiling(max) 의 이 비율만큼 매 주기 덧셈. 작게(0.03) 잡아 완만히 상승.
+const RECOVER_STEP_FRAC: f64 = 0.03;
+/// 이 EWMA 손실률 이상이면 회복(증가)을 아예 보류한다 — 잔여 손실이 있으면 올리지 않는다.
+const RECOVER_LOSS_GATE: f64 = 0.02;
 /// FEC parity 하한(%): 무손실~경미 손실 시. Moonlight 기본보다 약간 낮춰 평상시 전송량 절감.
 const FEC_MIN_PCT: u32 = 15;
 /// FEC parity 상한(%): 경미한 랜덤 손실 복구용. 혼잡 회선에선 FEC 증가가 오히려 독이므로
@@ -159,6 +162,12 @@ impl BitrateController {
         if since_loss < RECOVER_DELAY_MS {
             return cur;
         }
+        // 잔여 손실 게이트: EWMA 손실이 남아있으면 회복하지 않는다. 손실이 있는데 올리면
+        // 즉시 재손실 → 진동. 손실이 완전히 감쇠(EWMA<gate)해야 비로소 올린다.
+        let ewma = self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6;
+        if ewma >= RECOVER_LOSS_GATE {
+            return cur;
+        }
         if now.duration_since(t.last_recover).as_millis() < RECOVER_INTERVAL_MS {
             return cur;
         }
@@ -282,31 +291,33 @@ mod tests {
         c.configure(20_000_000); // start 10M
         c.on_loss(0.1); // → 6M
         assert_eq!(c.poll_target(), 6_000_000);
-        // 손실/회복 타이밍을 과거로 밀어 회복 조건 충족.
+        // 손실/회복 타이밍을 충분히 과거로(>RECOVER_DELAY 5s) + 잔여 손실 EWMA 제거(게이트 통과).
         {
             let mut t = c.timing.lock();
-            let past = Instant::now() - std::time::Duration::from_secs(5);
+            let past = Instant::now() - std::time::Duration::from_secs(10);
             t.last_loss = Some(past);
             t.last_recover = past;
         }
+        c.loss_ewma_ppm.store(0, Ordering::Release);
         let after = c.poll_target();
         assert!(after > 6_000_000, "expected recovery increase, got {after}");
-        // 스텝 = max*0.05 = 1M → 7M.
-        assert_eq!(after, 7_000_000);
+        // 스텝 = max*0.03 = 600K → 6.6M.
+        assert_eq!(after, 6_600_000);
     }
 
     #[test]
     fn recovery_caps_at_ceiling() {
         let c = BitrateController::default();
         c.configure(20_000_000);
-        c.on_loss(0.5); // → 10M
-        for _ in 0..100 {
+        c.on_loss(0.5); // → 5M
+        for _ in 0..200 {
             {
                 let mut t = c.timing.lock();
-                let past = Instant::now() - std::time::Duration::from_secs(5);
+                let past = Instant::now() - std::time::Duration::from_secs(10);
                 t.last_loss = Some(past);
                 t.last_recover = past;
             }
+            c.loss_ewma_ppm.store(0, Ordering::Release);
             c.poll_target();
         }
         assert_eq!(c.poll_target(), 20_000_000);
