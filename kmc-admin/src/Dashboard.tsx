@@ -388,35 +388,6 @@ function codecFromSps(annexb: Uint8Array): string | null {
 const HEVC_CODEC = "hvc1.1.6.L153.B0";
 
 
-// JS KeyboardEvent.code → Windows Virtual-Key 코드(호스트가 그대로 SendInput에 사용).
-function vkFromCode(e: KeyboardEvent): number {
-  const c = e.code;
-  if (/^Key[A-Z]$/.test(c)) return 0x41 + (c.charCodeAt(3) - 65);
-  if (/^Digit[0-9]$/.test(c)) return 0x30 + (c.charCodeAt(5) - 48);
-  if (/^Numpad[0-9]$/.test(c)) return 0x60 + (c.charCodeAt(6) - 48);
-  if (/^F([1-9]|1[0-2])$/.test(c)) return 0x70 + (parseInt(c.slice(1), 10) - 1);
-  const m: Record<string, number> = {
-    Enter: 0x0d, NumpadEnter: 0x0d, Escape: 0x1b, Backspace: 0x08, Tab: 0x09, Space: 0x20,
-    ArrowLeft: 0x25, ArrowUp: 0x26, ArrowRight: 0x27, ArrowDown: 0x28,
-    Home: 0x24, End: 0x23, PageUp: 0x21, PageDown: 0x22, Insert: 0x2d, Delete: 0x2e,
-    ShiftLeft: 0xa0, ShiftRight: 0xa1, ControlLeft: 0xa2, ControlRight: 0xa3,
-    AltLeft: 0xa4, AltRight: 0xa5, MetaLeft: 0x5b, MetaRight: 0x5c,
-    CapsLock: 0x14, NumLock: 0x90, ScrollLock: 0x91, ContextMenu: 0x5d, PrintScreen: 0x2c,
-    Minus: 0xbd, Equal: 0xbb, BracketLeft: 0xdb, BracketRight: 0xdd, Backslash: 0xdc,
-    Semicolon: 0xba, Quote: 0xde, Backquote: 0xc0, Comma: 0xbc, Period: 0xbe, Slash: 0xbf,
-    NumpadAdd: 0x6b, NumpadSubtract: 0x6d, NumpadMultiply: 0x6a, NumpadDivide: 0x6f, NumpadDecimal: 0x6e,
-  };
-  return m[c] ?? 0;
-}
-
-function modMask(e: { shiftKey: boolean; ctrlKey: boolean; altKey: boolean; metaKey: boolean }): number {
-  return (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
-}
-
-// JS MouseEvent.button(0=L,1=M,2=R,3=X1,4=X2) → moonlight 버튼(1..5).
-function jsToButton(b: number): number {
-  return b === 0 ? 1 : b === 1 ? 2 : b === 2 ? 3 : b === 3 ? 4 : b === 4 ? 5 : 0;
-}
 
 function StreamView({
   agent,
@@ -437,6 +408,7 @@ function StreamView({
     standard: { w: 1600, h: 1600, label: "표준 (~1600)" },
   };
   const [quality, setQuality] = useState<keyof typeof QUALITY>("high");
+  const [hovering, setHovering] = useState(false); // sidecar 가 보고한 마우스 hover(캡처 표시용).
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // 연결: 세션 요청(주소 획득) → 그 호스트로 스트림 시작. 노트북 선택 후 버튼 하나로 완결.
@@ -592,89 +564,67 @@ function StreamView({
     };
   }, [streaming]);
 
-  // 원격 입력: canvas의 마우스/키보드/휠을 캡처해 Tauri 커맨드로 호스트에 전달.
+  // 원격 입력: 키보드/마우스는 네이티브 sidecar(kmc-keyhook.exe)가 저수준 훅으로 캡처한다
+  // (WebView2 포커스 시 in-process 훅이 안 먹는 문제 회피). 프론트는 canvas 의 "화면 절대
+  // 사각형(물리 px)"만 sidecar 에 보고하면, sidecar 가 마우스 hover 판정 + 좌표 변환을 한다.
   useEffect(() => {
     if (!streaming) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    let alive = true;
-
-    const toStream = (clientX: number, clientY: number) => {
-      const rect = canvas.getBoundingClientRect();
-      const w = canvas.width || 1920;
-      const h = canvas.height || 1080;
-      const x = Math.max(0, Math.min(w, Math.round(((clientX - rect.left) / rect.width) * w)));
-      const y = Math.max(0, Math.min(h, Math.round(((clientY - rect.top) / rect.height) * h)));
-      return { x, y, w, h };
-    };
-
-    // 마우스 이동은 rAF로 코얼레스(IPC 폭주 방지).
-    let pendingMove: { x: number; y: number; w: number; h: number } | null = null;
-    const pump = () => {
-      if (!alive) return;
-      if (pendingMove) {
-        const p = pendingMove;
-        pendingMove = null;
-        invoke("stream_mouse_move", p).catch(() => {});
+    // canvas 의 화면 절대 사각형(물리 px)을 계산해 sidecar 로 전달.
+    // getBoundingClientRect 는 CSS px(뷰포트 기준) → 창 콘텐츠 원점(innerPosition, 물리 px) +
+    // scaleFactor 로 화면 물리 좌표로 환산.
+    const reportRect = async () => {
+      try {
+        const r = canvas.getBoundingClientRect();
+        // 화면 절대 물리 px = (창 스크린 위치 + 뷰포트 내 CSS 좌표) * devicePixelRatio.
+        // window.screenX/Y 는 브라우저(webview) 창의 스크린 좌표(CSS px). 순수 웹 API라 권한 불필요.
+        const dpr = window.devicePixelRatio || 1;
+        const originX = window.screenX + (window.outerWidth - window.innerWidth);
+        const originY = window.screenY + (window.outerHeight - window.innerHeight);
+        const l = Math.round((originX + r.left) * dpr);
+        const t = Math.round((originY + r.top) * dpr);
+        const rr = Math.round((originX + r.right) * dpr);
+        const b = Math.round((originY + r.bottom) * dpr);
+        await invoke("set_canvas_rect", { l, t, r: rr, b });
+      } catch (e) {
+        await invoke("set_canvas_rect", { l: -1, t: -1, r: -1, b: -1 }).catch(() => {});
+        void e;
       }
-      requestAnimationFrame(pump);
     };
-    requestAnimationFrame(pump);
 
-    const onMove = (e: MouseEvent) => {
-      pendingMove = toStream(e.clientX, e.clientY);
-    };
-    const onDown = (e: MouseEvent) => {
-      canvas.focus();
-      e.preventDefault();
-      // 클릭 좌표를 먼저 반영한 뒤 버튼.
-      const p = toStream(e.clientX, e.clientY);
-      invoke("stream_mouse_move", p).catch(() => {});
-      const b = jsToButton(e.button);
-      if (b) invoke("stream_mouse_button", { button: b, down: true }).catch(() => {});
-    };
-    const onUp = (e: MouseEvent) => {
-      const b = jsToButton(e.button);
-      if (b) invoke("stream_mouse_button", { button: b, down: false }).catch(() => {});
-    };
+    // 초기 + 레이아웃 변화 시 갱신. 창 이동은 JS 이벤트가 없어 폴링으로 보완(가벼움).
+    reportRect();
+    const ro = new ResizeObserver(() => reportRect());
+    ro.observe(canvas);
+    window.addEventListener("resize", reportRect);
+    window.addEventListener("scroll", reportRect, true);
+    const poll = window.setInterval(reportRect, 500);
+
+    // contextmenu 는 브라우저 기본 메뉴만 막는다(우클릭 자체는 sidecar 가 원격 전달).
     const onCtx = (e: MouseEvent) => e.preventDefault();
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      // deltaY>0(아래로 스크롤) → 휠 델타 음수. WHEEL_DELTA=120.
-      invoke("stream_scroll", { amount: e.deltaY > 0 ? -120 : 120 }).catch(() => {});
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      const vk = vkFromCode(e);
-      if (vk) {
-        e.preventDefault();
-        invoke("stream_key", { code: vk, down: true, modifiers: modMask(e) }).catch(() => {});
-      }
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      const vk = vkFromCode(e);
-      if (vk) {
-        e.preventDefault();
-        invoke("stream_key", { code: vk, down: false, modifiers: modMask(e) }).catch(() => {});
-      }
-    };
-
-    canvas.addEventListener("mousemove", onMove);
-    canvas.addEventListener("mousedown", onDown);
-    window.addEventListener("mouseup", onUp);
     canvas.addEventListener("contextmenu", onCtx);
-    canvas.addEventListener("wheel", onWheel, { passive: false });
-    canvas.addEventListener("keydown", onKeyDown);
-    canvas.addEventListener("keyup", onKeyUp);
 
     return () => {
-      alive = false;
-      canvas.removeEventListener("mousemove", onMove);
-      canvas.removeEventListener("mousedown", onDown);
-      window.removeEventListener("mouseup", onUp);
+      ro.disconnect();
+      window.removeEventListener("resize", reportRect);
+      window.removeEventListener("scroll", reportRect, true);
+      window.clearInterval(poll);
       canvas.removeEventListener("contextmenu", onCtx);
-      canvas.removeEventListener("wheel", onWheel);
-      canvas.removeEventListener("keydown", onKeyDown);
-      canvas.removeEventListener("keyup", onKeyUp);
+      // rect 무효화(hover off) — 스트림 종료 시 캡처 안 되도록.
+      invoke("set_canvas_rect", { l: 0, t: 0, r: 0, b: 0 }).catch(() => {});
+    };
+  }, [streaming]);
+
+  // sidecar 가 보고하는 hover 상태를 배지에 반영(streaming 아닐 땐 false).
+  useEffect(() => {
+    if (!streaming) {
+      setHovering(false);
+      return;
+    }
+    const un = listen<boolean>("hover", (e) => setHovering(!!e.payload));
+    return () => {
+      un.then((f) => f()).catch(() => {});
     };
   }, [streaming]);
 
@@ -820,13 +770,19 @@ function StreamView({
           )}
         </div>
         {status && <p className="text-sm text-muted-foreground">{status}</p>}
-        <div className="flex justify-center overflow-hidden rounded border border-border bg-black">
+        <div className="relative flex justify-center overflow-hidden rounded border border-border bg-black">
           {streaming ? (
-            <canvas
-              ref={canvasRef}
-              tabIndex={0}
-              className="block max-h-[75vh] w-auto min-h-0 min-w-0 max-w-full cursor-crosshair object-contain outline-none"
-            />
+            <>
+              <canvas
+                ref={canvasRef}
+                tabIndex={0}
+                className="block max-h-[75vh] w-auto min-h-0 min-w-0 max-w-full cursor-crosshair object-contain outline-none"
+              />
+              <div className="pointer-events-none absolute left-2 top-2 rounded px-2 py-1 text-xs font-medium"
+                style={{ background: hovering ? "rgba(22,163,74,0.85)" : "rgba(0,0,0,0.6)", color: "white" }}>
+                {hovering ? "입력 캡처 중 (마우스가 영상 위)" : "영상 위로 마우스를 올리면 입력 캡처"}
+              </div>
+            </>
           ) : (
             <div className="flex h-64 w-full items-center justify-center text-sm text-muted-foreground">
               연결하면 화면이 표시됩니다

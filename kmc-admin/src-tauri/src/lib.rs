@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 pub mod stream;
 #[cfg(windows)]
-pub mod kbhook;
+pub mod keyhook;
 use stream::{SharedStream, StreamState};
 
 /// 로그인 세션(hub 접속 정보 + admin 토큰).
@@ -256,7 +256,9 @@ async fn start_stream(
         .map_err(|e| format!("start_stream: {e}"));
     #[cfg(windows)]
     if r.is_ok() {
-        kbhook::set_streaming(true);
+        // 연결 버튼을 방금 눌렀으니 admin 이 포커스 상태 — 시드로 설정(이후 Focused 이벤트가 갱신).
+        keyhook::set_focused(true);
+        keyhook::set_streaming(true);
     }
     r
 }
@@ -264,8 +266,17 @@ async fn start_stream(
 #[tauri::command]
 fn stop_stream(stream: State<'_, SharedStream>) {
     #[cfg(windows)]
-    kbhook::set_streaming(false);
+    keyhook::set_streaming(false);
     stream.stop();
+}
+
+/// 프론트가 canvas 화면 절대 사각형(물리 px)을 보고. sidecar 가 마우스 hover 판정 + 좌표 변환에 사용.
+#[tauri::command]
+fn set_canvas_rect(l: i32, t: i32, r: i32, b: i32) {
+    #[cfg(windows)]
+    keyhook::set_canvas_rect(l, t, r, b);
+    #[cfg(not(windows))]
+    let _ = (l, t, r, b);
 }
 
 /// 로컬 스트림 WS 서버 포트. 프론트는 이 포트로 ws://127.0.0.1:PORT 에 붙어
@@ -315,16 +326,19 @@ fn stream_scroll(amount: i32) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // admin 창 포커스 변화를 키보드 캡처 게이트에 반영: 포커스일 때만 그랩(아웃포커스면 로컬 통과).
+        .on_window_event(|_window, _event| {
+            #[cfg(windows)]
+            if let tauri::WindowEvent::Focused(focused) = _event {
+                keyhook::set_focused(*focused);
+            }
+        })
         // 스트림 프레임은 로컬 WebSocket으로 전달한다(stream.rs). 커스텀 프로토콜/RGBA 경로 제거됨.
         .setup(|app| {
             app.manage::<SharedBackend>(Arc::new(Backend::default()));
             app.manage::<SharedStream>(Arc::new(StreamState::default()));
             #[cfg(windows)]
-            if let Some(win) = app.get_webview_window("main") {
-                if let Ok(hwnd) = win.hwnd() {
-                    kbhook::install(hwnd.0 as isize);
-                }
-            }
+            keyhook::install(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -340,7 +354,8 @@ pub fn run() {
             stream_key,
             stream_scroll,
             stream_audio_port,
-            stream_codec
+            stream_codec,
+            set_canvas_rect
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

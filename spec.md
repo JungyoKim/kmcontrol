@@ -165,7 +165,7 @@
 | **스트리밍(자체구현)** | `kmc-streamhost`(GameStream 호스트), `kmc-moonclient`(클라), `kmc-admin`(Tauri) | 페어링 제거 후 WebCodecs GPU 디코드, 60fps E2E |
 | **코덱: H.264 (HEVC 보류)** | streamhost `qsv.rs` `h264_qsv`(Main, veryfast, low_delay_brc, 네이티브 해상도+비트레이트 하한), `webserver.rs` H.264 단독 광고(codec_support 0x0001, MaxLumaPixelsHEVC=0), moonclient H.264 요청, 프론트 WebCodecs `avc1.*`(SPS 파싱) codedWidth 전체 그리기 | **라이브 E2E 검증**: 노트북(Intel Arc, 2880×1800 네이티브) admin 스트림 `codec=h264`, 캔버스 2880×1808, 전체 데스크톱 잘림 없이 표시(CDP 픽셀 샘플 전 영역 내용). **HEVC 보류**: hevc_qsv 가 이 GPU 에서 SPS conformance window 를 1280×720 으로 잘못 기록→디코더가 좌상단만 표시. H.264 는 정상 |
 | 오디오 | streamhost WASAPI 루프백→Opus→RTP, 프론트 WebCodecs AudioDecoder | E2E (100 Opus 프레임) |
-| 원격 입력 | control 0x0206→SendInput, 프론트 canvas 캡처 | E2E (커서 이동 실증) |
+| **원격 입력(키보드+마우스)** | **별도 프로세스 sidecar `kmc-keyhook.exe`** 가 저수준 훅(WH_KEYBOARD_LL+WH_MOUSE_LL) 소유 → admin(Tauri/WebView2)이 포그라운드일 때 admin-내부 훅 콜백이 안 오는 WebView2 제약 회피(실측: 내부 0회 vs 별도 프로세스 227회). 게이트 = 스트리밍 AND admin포커스(WindowEvent::Focused) AND 마우스가 canvas 위(sidecar가 프론트 보고 화면 rect와 마우스 절대좌표 비교). 키/버튼 소유권 추적으로 DOWN 이 간 곳(로컬/원격)으로 UP 도 보내 경계 전환 시 stuck 방지 + 스트림 종료 시 release-all. stdin(s/f/r 토글·rect)·stdout(k/mm/mb/ms/h) 파이프 IPC | 라이브 E2E (키/마우스 원격, hover 게이트, 경계 stuck 해소 실증) |
 | agent↔스트림 통합 | agent가 streamhost in-process 기동, hub가 peer IP→세션 주소 반환 | E2E |
 | **MCP 서버(AI 자동진단)** | `kmc-mcp`(rmcp stdio) 9도구: `list_agents`/`run_powershell`/`run_powershell_all`(팬아웃)/`gui_action`/`gui_sequence` + 전용 브라우저 `web_open`/`web_read`/`web_click`/`web_type` | E2E (전 도구) |
 | **GUI 자동화** | cua-driver(MIT) CLI 셸아웃 브리지 (`CommandKind::Gui`) — 백그라운드 조작 | E2E (list_windows/apps, notepad 조작) |
