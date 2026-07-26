@@ -27,3 +27,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 kmc-proto = { path = "../kmc-proto" }
 # 자체 GameStream 호스트(Sunshine 대체) — agent가 in-process로 기동. Windows 전용.
 kmc-streamhost = { path = "../kmc-streamhost" }
+
+# 단일 인스턴스 가드(명명 뮤텍스). 중복 실행은 GameStream 포트를 서로 뺏어
+# 뒤에 뜬 쪽의 호스트가 죽는다 - 실제로 발생했다.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }

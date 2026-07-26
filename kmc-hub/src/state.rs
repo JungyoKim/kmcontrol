@@ -15,6 +15,10 @@ pub struct AgentConn {
     pub name: String,
     pub tx: mpsc::UnboundedSender<HubToAgent>,
     pub last_status: Option<StatusReport>,
+    /// 이 연결의 고유 식별자. 같은 agent_id 로 새 연결이 들어와 이 항목을 대체한 뒤
+    /// 옛 연결이 뒤늦게 끊길 때, 옛 연결의 정리가 살아있는 새 연결을 지우지 않도록
+    /// 구분하는 데 쓴다(`agent_ws::cleanup` 참고).
+    pub conn_id: u64,
 }
 
 /// 제어 세션(락).

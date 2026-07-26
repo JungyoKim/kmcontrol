@@ -12,6 +12,9 @@ use uuid::Uuid;
 use crate::db;
 use crate::state::{AgentConn, AppState};
 
+/// 연결마다 발급하는 단조 증가 식별자. 같은 agent_id 의 옛/새 연결을 구분한다.
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub async fn handler(
     ws: WebSocketUpgrade,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -68,13 +71,26 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer_ip: String) {
     }
 
     // 2. 등록.
+    // 같은 agent_id 로 이미 연결이 있으면(중복 실행·재접속 레이스) 이 새 연결이 대체한다.
+    // 대체된 옛 연결의 tx 는 여기서 drop 되어 그쪽 송신 태스크가 스스로 종료된다.
+    let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded_channel::<HubToAgent>();
     {
         let mut online = state.0.online.lock();
-        online.insert(
+        // 재접속 시 상태 보고가 한 번 들어올 때까지 화면이 비지 않도록 직전 상태를 물려준다.
+        let prev = online.insert(
             agent_id,
-            AgentConn { name: name.clone(), tx, last_status: None },
+            AgentConn { name: name.clone(), tx, last_status: None, conn_id },
         );
+        if let Some(prev) = prev {
+            if let Some(entry) = online.get_mut(&agent_id) {
+                entry.last_status = prev.last_status;
+            }
+            tracing::warn!(
+                %agent_id, %name, old_conn = prev.conn_id, new_conn = conn_id,
+                "duplicate agent connection - replacing previous (agent 중복 실행 의심)"
+            );
+        }
     }
     // 스트리밍 타겟 주소: agent 가 보고한 tailnet IP 우선, 없으면 WS peer_ip 폴백.
     // (공개 hub 뒤에서는 peer_ip 가 프록시 내부 IP 라 쓸모없으므로 보고값이 필수.)
@@ -84,7 +100,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer_ip: String) {
 
     // HelloOk 전송.
     if send_json(&mut sink, &HubToAgent::HelloOk).await.is_err() {
-        cleanup(&state, agent_id).await;
+        cleanup(&state, agent_id, conn_id).await;
         return;
     }
     state.broadcast_agent(agent_id);
@@ -157,7 +173,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, peer_ip: String) {
 
     // 4. 종료 정리.
     send_task.abort();
-    cleanup(&state, agent_id).await;
+    cleanup(&state, agent_id, conn_id).await;
 }
 
 fn agent_name(state: &AppState, agent_id: Uuid) -> String {
@@ -170,10 +186,26 @@ fn agent_name(state: &AppState, agent_id: Uuid) -> String {
         .unwrap_or_else(|| agent_id.to_string())
 }
 
-async fn cleanup(state: &AppState, agent_id: Uuid) {
+/// 이 연결(`conn_id`)이 여전히 등록된 현행 연결일 때만 정리한다.
+/// 이미 새 연결로 교체된 뒤라면 아무것도 건드리지 않는다 - 그러지 않으면 뒤늦게
+/// 끊긴 옛 연결이 살아있는 새 연결의 주소·제어세션까지 지워 agent 가 오프라인으로
+/// 잘못 표시된다(agent 중복 실행·재접속 레이스에서 발생).
+///
+/// 실측(임시 hub + 같은 agent_id WS 2개): ws1 접속 -> ws2 접속으로 교체
+/// (`old_conn=1 new_conn=2`) -> **ws1 종료 시 `stale agent conn closed` 만 찍히고
+/// `agent offline` 은 없음** -> ws2 종료에서야 `agent offline`.
+async fn cleanup(state: &AppState, agent_id: Uuid, conn_id: u64) {
     {
         let mut online = state.0.online.lock();
-        online.remove(&agent_id);
+        match online.get(&agent_id) {
+            Some(c) if c.conn_id == conn_id => {
+                online.remove(&agent_id);
+            }
+            _ => {
+                tracing::debug!(%agent_id, conn_id, "stale agent conn closed - 현행 등록 유지");
+                return;
+            }
+        }
     }
     state.0.agent_addr.lock().remove(&agent_id);
     // 해당 agent의 세션 락 해제.

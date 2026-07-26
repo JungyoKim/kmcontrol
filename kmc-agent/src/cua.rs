@@ -1,9 +1,17 @@
 //! cua-driver 데몬 수명주기 — agent가 상시 보장한다.
 //!
 //! GUI/브라우저 자동화는 전부 cua-driver 데몬(`\\.\pipe\cua-driver`)을 거치므로,
-//! 데몬이 죽으면 모든 조작이 실패한다. agent가 (1) startup에 데몬을 보장하고,
-//! (2) 로그온 자동 기동(스케줄 작업)을 등록하며, (3) 조작 중 데몬이 죽으면
-//! exec 레이어가 이 모듈로 되살려 재시도한다.
+//! 데몬이 죽으면 모든 조작이 실패한다. 보장은 3중이다: (1) agent startup에서
+//! `ensure_daemon`, (2) 브라우저 조작 직전 `browser.rs`, (3) 조작 중 데몬이 죽으면
+//! `exec.rs`가 되살려 재시도.
+//!
+//! **로그온 스케줄 작업(`cua-driver autostart enable`)은 일부러 쓰지 않는다.**
+//! agent는 HKCU Run으로 이미 로그온마다 뜨고 그때 (1)이 데몬을 띄우므로 순수 잉여인데,
+//! 등록되는 작업은 `RunLevel=Highest`(승격 실행)라 특권 경계를 건드린다.
+//! 게다가 startup마다 이 호출을 하면 그만큼 기동이 늦는다 — 실측: 학생 노트북 로그에서
+//! `tailscale already connected`(15:28:14.770) -> `autostart enable ok=true`(15:28:38.708),
+//! **이 한 줄이 23.9초**. Hello 가 그만큼 밀린다.
+//! 특권 작업은 elevated 인스톨러만 한다는 규칙(`tailscale.rs` 참고)을 여기에도 적용한다.
 
 use std::os::windows::process::CommandExt;
 use std::process::Command;
@@ -48,13 +56,4 @@ pub fn ensure_daemon() -> bool {
     }
     tracing::warn!("cua-driver daemon did not become ready");
     false
-}
-
-/// 로그온 시 데몬 자동 기동 등록(Windows 스케줄 작업). best-effort — 실패해도 계속.
-pub fn enable_autostart() {
-    let exe = crate::exec::cua_driver_path();
-    match Command::new(&exe).args(["autostart", "enable"]).output() {
-        Ok(o) => tracing::info!(ok = o.status.success(), "cua-driver autostart enable"),
-        Err(e) => tracing::warn!(error = %e, "cua-driver autostart enable failed"),
-    }
 }
