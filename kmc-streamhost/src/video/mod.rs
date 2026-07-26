@@ -51,6 +51,11 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
         // 소유권: 활성 클라이언트가 최근 PING했으면 다른 주소의 PING을 무시(동시 세션 진동 방지).
         let mut last_ping = std::time::Instant::now();
         const OWNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        // RTT 프로브의 기준 시계. 타임스탬프를 찍는 쪽과 재는 쪽이 모두 여기이므로
+        // 클라이언트와 시계를 맞출 필요가 없다.
+        let probe_epoch = std::time::Instant::now();
+        /// 이보다 큰 왕복값은 프로브가 아니라 쓰레기(지연 도착/중복 에코)로 보고 버린다.
+        const MAX_SANE_RTT_MS: u32 = 5_000;
 
         loop {
             tokio::select! {
@@ -58,7 +63,7 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                 msg = socket.recv_from(&mut recv_buf) => {
                     match msg {
                         Ok((len, addr)) => {
-                            if &recv_buf[..len] == b"PING" {
+                            if recv_buf[..len] == *kmc_gsproto::PING_PAYLOAD {
                                 let owner_active = client_addr.is_some()
                                     && client_addr != Some(addr)
                                     && last_ping.elapsed() < OWNER_TIMEOUT;
@@ -77,6 +82,28 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                                     client_addr = Some(addr);
                                     last_ping = std::time::Instant::now();
                                     client_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    // RTT 프로브 동봉: 클라가 이 12바이트를 그대로 되돌려준다.
+                                    let probe = kmc_gsproto::rtt_probe(
+                                        probe_epoch.elapsed().as_micros() as u64,
+                                    );
+                                    if let Err(e) = socket.send_to(&probe, addr).await {
+                                        tracing::trace!(error = %e, "rtt probe send failed");
+                                    }
+                                }
+                            } else if let Some(sent_us) = kmc_gsproto::parse_rtt_probe(
+                                &recv_buf[..len],
+                            )
+                            .filter(|_| client_addr == Some(addr))
+                            {
+                                // 되돌아온 프로브 → 왕복 시간. 손실이 나기 전에 큐 적체를 잡는다.
+                                // 등록된 클라이언트에서 온 것만 받는다: min_rtt 는 러닝 최소값이라
+                                // 위조된 낮은 샘플 하나가 기준선을 영구히 낮춰, 이후 정상 RTT 를
+                                // 전부 "부풀었다"로 오판하게 만든다.
+                                let rtt_us =
+                                    (probe_epoch.elapsed().as_micros() as u64).saturating_sub(sent_us);
+                                let rtt_ms = (rtt_us / 1000) as u32;
+                                if rtt_ms <= MAX_SANE_RTT_MS {
+                                    bitrate.on_rtt(rtt_ms);
                                 }
                             } else {
                                 tracing::trace!(len, %addr, "non-PING on video socket");

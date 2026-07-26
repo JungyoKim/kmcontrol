@@ -49,6 +49,26 @@ const FEC_SATURATION_LOSS: f64 = 0.10;
 const LOSS_DECAY_GRACE_MS: u128 = 500;
 /// EWMA 손실률 감쇠 반감기(유예 이후 기준).
 const LOSS_HALF_LIFE_MS: f64 = 2000.0;
+/// RTT 가 `min_rtt` 대비 이만큼(ms) 넘게 부풀면 큐 적체로 본다.
+const RTT_INFLATION_MS: u32 = 30;
+/// 이만큼 연속 샘플이 부풀어야 감속한다(단발 스파이크 무시). 프로브 2Hz → 3샘플 ≈ 1.5s.
+const RTT_TRIGGER_SAMPLES: u32 = 3;
+/// 지연 기반 감속 계수. 손실 기반(0.5~0.75)보다 완만하다 — 조기 경보이므로 살짝만 물러선다.
+const RTT_DECREASE_FACTOR: f64 = 0.85;
+/// 지연 기반 감속 스로틀. 한 번 낮추면 효과가 RTT 에 나타날 때까지 기다린다.
+const RTT_DECREASE_THROTTLE_MS: u128 = 1000;
+/// `min_rtt` 재학습 윈도우. 경로가 바뀌어 기준선이 올라갔을 때 낡은 최소값에 묶이지 않게 한다.
+const MIN_RTT_WINDOW_MS: u128 = 30_000;
+/// RTT 샘플이 이보다 낡으면 지연 신호를 신뢰하지 않는다(프로브가 끊긴 경우 회복 영구 차단 방지).
+const RTT_STALE_MS: u128 = 3000;
+
+/// 지연 임계(ms): 절대값과 `min_rtt` 의 절반 중 **큰** 쪽.
+///
+/// 절대값만 쓰면 기준 RTT 가 200ms 인 회선에서 30ms 흔들림에도 과민 반응하고, 상대값만 쓰면
+/// 기준 RTT 가 2ms 인 LAN 에서 1ms 지터에 반응한다.
+fn rtt_trigger_ms(min_rtt_ms: u32) -> u32 {
+    RTT_INFLATION_MS.max(min_rtt_ms / 2)
+}
 
 /// 저장된 EWMA 손실률(= 마지막 손실 시점의 값)에 경과 시간 감쇠를 적용한다.
 ///
@@ -72,6 +92,18 @@ struct Timing {
     last_loss: Option<Instant>,
     last_decrease: Instant,
     last_recover: Instant,
+    /// 관측된 최소 RTT(ms). `u32::MAX` = 샘플 없음. 큐가 비었을 때의 기준선이다.
+    min_rtt_ms: u32,
+    /// 현재 재학습 윈도우 안의 최소 RTT(ms). 윈도우가 끝나면 `min_rtt_ms` 를 대체한다.
+    win_min_rtt_ms: u32,
+    /// 재학습 윈도우 시작 시각.
+    min_rtt_epoch: Instant,
+    /// 마지막 RTT 샘플(ms)과 관측 시각.
+    last_rtt: Option<(u32, Instant)>,
+    /// 연속으로 임계를 넘은 RTT 샘플 수.
+    rtt_streak: u32,
+    /// 마지막 지연 기반 감속 시각.
+    last_rtt_decrease: Instant,
 }
 
 /// 스로틀 윈도우보다 충분히 과거인 시각(첫 손실/회복이 즉시 통과하도록 초기화용).
@@ -102,21 +134,9 @@ pub struct BitrateController {
 }
 
 impl BitrateController {
+    /// control 채널과 인코드 루프가 공유할 컨트롤러. 필드 초기화는 `Default` 하나만 존재한다.
     pub fn new() -> Arc<Self> {
-        let now = Instant::now();
-        Arc::new(Self {
-            target: AtomicU32::new(0),
-            min: AtomicU32::new(0),
-            max: AtomicU32::new(0),
-            timing: Mutex::new(Timing {
-                last_loss: None,
-                last_decrease: now,
-                last_recover: now,
-            }),
-            loss_ewma_ppm: AtomicU32::new(0),
-            learned_ceiling: AtomicU32::new(0),
-            probe_cap: AtomicU32::new(0),
-        })
+        Arc::new(Self::default())
     }
 
     pub fn configure(&self, ceiling_bps: u32) {
@@ -135,6 +155,13 @@ impl BitrateController {
         t.last_loss = None;
         t.last_decrease = stale_instant();
         t.last_recover = Instant::now();
+        // RTT 기준선도 세션마다 새로 학습한다(직전 세션의 회선과 무관).
+        t.min_rtt_ms = u32::MAX;
+        t.win_min_rtt_ms = u32::MAX;
+        t.min_rtt_epoch = Instant::now();
+        t.last_rtt = None;
+        t.rtt_streak = 0;
+        t.last_rtt_decrease = stale_instant();
         self.loss_ewma_ppm.store(0, Ordering::Release);
         // 학습 상한/재탐색 상한을 ceiling 으로 초기화(아직 실패 미관측 → 전체 대역 탐색 허용).
         self.learned_ceiling.store(ceiling, Ordering::Release);
@@ -200,6 +227,47 @@ impl BitrateController {
         );
     }
 
+    /// RTT 프로브 결과(ms). 손실이 **나기 전에** 큐 적체를 잡는 조기 신호다.
+    ///
+    /// 손실 기반 AIMD 는 회선 한계를 찾으려면 손실을 만들어내야 하고, 손실이 관측된 시점엔 이미
+    /// 프레임이 깨진 뒤다. 지연은 병목 큐가 차는 순간 올라가므로 그 앞에서 물러설 수 있다.
+    /// 여기서는 학습 상한(`learned_ceiling`)을 건드리지 않는다 — 지연은 손실보다 약한 신호라
+    /// 하향 래칫까지 걸면 회선이 좋아져도 못 올라온다.
+    pub fn on_rtt(&self, rtt_ms: u32) {
+        if self.max.load(Ordering::Acquire) == 0 {
+            return; // 미설정(협상 전).
+        }
+        let now = Instant::now();
+        let mut t = self.timing.lock();
+
+        if now.duration_since(t.min_rtt_epoch).as_millis() >= MIN_RTT_WINDOW_MS {
+            t.min_rtt_ms = t.win_min_rtt_ms;
+            t.win_min_rtt_ms = u32::MAX;
+            t.min_rtt_epoch = now;
+        }
+        t.min_rtt_ms = t.min_rtt_ms.min(rtt_ms);
+        t.win_min_rtt_ms = t.win_min_rtt_ms.min(rtt_ms);
+        t.last_rtt = Some((rtt_ms, now));
+
+        if rtt_ms.saturating_sub(t.min_rtt_ms) < rtt_trigger_ms(t.min_rtt_ms) {
+            t.rtt_streak = 0;
+            return;
+        }
+        t.rtt_streak += 1;
+        if t.rtt_streak < RTT_TRIGGER_SAMPLES {
+            return;
+        }
+        if now.duration_since(t.last_rtt_decrease).as_millis() < RTT_DECREASE_THROTTLE_MS {
+            return;
+        }
+        let cur = self.target.load(Ordering::Acquire);
+        let next = ((cur as f64 * RTT_DECREASE_FACTOR) as u32).max(self.min.load(Ordering::Acquire));
+        self.target.store(next, Ordering::Release);
+        t.last_rtt_decrease = now;
+        t.rtt_streak = 0;
+        tracing::debug!(rtt_ms, min_rtt = t.min_rtt_ms, from = cur, to = next, "bitrate: delay → decrease");
+    }
+
     /// 목표 비트레이트를 읽는다. 무손실이 지속되면 이 호출 안에서 시간 기반 덧셈 회복을 수행한다.
     /// 인코드 루프가 매 반복 호출한다(pull 방식).
     pub fn poll_target(&self) -> u32 {
@@ -221,6 +289,17 @@ impl BitrateController {
         );
         if ewma >= RECOVER_LOSS_GATE {
             return cur;
+        }
+        // 지연 게이트: RTT 가 부풀어 있으면(큐 적체) 올리지 않는다. 손실이 나기 전에 멈추는 게
+        // 목적이므로, 회복도 지연이 가라앉은 뒤에 시작해야 한다. 샘플이 낡았으면 무시한다 —
+        // 프로브가 끊겼는데 마지막 값이 '부풀었음'이면 회복이 영구히 막힌다.
+        if let Some((rtt, at)) = t.last_rtt {
+            if now.duration_since(at).as_millis() < RTT_STALE_MS
+                && t.min_rtt_ms != u32::MAX
+                && rtt.saturating_sub(t.min_rtt_ms) >= rtt_trigger_ms(t.min_rtt_ms)
+            {
+                return cur;
+            }
         }
         if now.duration_since(t.last_recover).as_millis() < RECOVER_INTERVAL_MS {
             return cur;
@@ -289,6 +368,12 @@ impl Default for BitrateController {
                 last_loss: None,
                 last_decrease: now,
                 last_recover: now,
+                min_rtt_ms: u32::MAX,
+                win_min_rtt_ms: u32::MAX,
+                min_rtt_epoch: now,
+                last_rtt: None,
+                rtt_streak: 0,
+                last_rtt_decrease: now,
             }),
             loss_ewma_ppm: AtomicU32::new(0),
             learned_ceiling: AtomicU32::new(0),
@@ -519,5 +604,99 @@ mod tests {
         let c = BitrateController::default();
         // 미설정이어도 안전한 하한을 반환(패킷타이저가 항상 유효 값을 받도록).
         assert_eq!(c.poll_fec_percentage(), FEC_MIN_PCT);
+    }
+
+    #[test]
+    fn first_rtt_samples_establish_baseline_without_decreasing() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        let start = c.poll_target();
+        // 기준선을 모르는 상태의 첫 샘플들은 그 자체가 min_rtt 가 된다 — 감속 근거가 없다.
+        for _ in 0..10 {
+            c.on_rtt(120);
+        }
+        assert_eq!(c.poll_target(), start, "기준선 학습 중에 감속했다");
+    }
+
+    #[test]
+    fn single_rtt_spike_is_ignored() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        c.on_rtt(20); // 기준선.
+        let start = c.poll_target();
+        c.on_rtt(300); // 단발 스파이크(무선 재전송/스케줄링 지터).
+        assert_eq!(c.poll_target(), start, "단발 스파이크에 반응했다");
+    }
+
+    #[test]
+    fn sustained_rtt_inflation_decreases_without_any_loss() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        c.on_rtt(20); // 기준선 20ms → 임계 = max(30, 10) = 30ms.
+        let start = c.poll_target();
+        for _ in 0..RTT_TRIGGER_SAMPLES {
+            c.on_rtt(100);
+        }
+        let after = c.poll_target();
+        assert!(after < start, "지연이 지속되는데 감속하지 않았다: {start} → {after}");
+        assert_eq!(after, (start as f64 * RTT_DECREASE_FACTOR) as u32);
+        // 손실은 한 번도 보고되지 않았다 — 조기 감속이 목적이다.
+        assert!(c.timing.lock().last_loss.is_none());
+    }
+
+    #[test]
+    fn rtt_decrease_respects_floor() {
+        let c = BitrateController::default();
+        c.configure(20_000_000); // floor 1M
+        c.target.store(1_000_000, Ordering::Release);
+        c.on_rtt(20);
+        for _ in 0..20 {
+            {
+                let mut t = c.timing.lock();
+                t.last_rtt_decrease = stale_instant();
+            }
+            c.on_rtt(500);
+        }
+        assert_eq!(c.poll_target(), 1_000_000, "floor 아래로 내려갔다");
+    }
+
+    #[test]
+    fn inflated_rtt_blocks_recovery() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        c.target.store(6_000_000, Ordering::Release);
+        c.on_rtt(20); // 기준선.
+        // 손실 기준으로는 회복 조건을 모두 만족시킨다.
+        {
+            let mut t = c.timing.lock();
+            let past = Instant::now() - std::time::Duration::from_secs(10);
+            t.last_loss = None;
+            t.last_recover = past;
+        }
+        c.on_rtt(200); // 부풀어 있음(스트릭 1 → 감속은 아직, 게이트는 즉시).
+        assert_eq!(c.poll_target(), 6_000_000, "지연이 부풀었는데 회복했다");
+        // 지연이 가라앉으면 회복이 재개된다.
+        c.on_rtt(21);
+        assert!(c.poll_target() > 6_000_000, "지연이 정상인데 회복하지 않았다");
+    }
+
+    #[test]
+    fn stale_rtt_sample_does_not_block_recovery_forever() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        c.target.store(6_000_000, Ordering::Release);
+        c.on_rtt(20);
+        c.on_rtt(200); // 부푼 상태로 프로브가 끊겼다고 가정.
+        {
+            let mut t = c.timing.lock();
+            let past = Instant::now() - std::time::Duration::from_secs(10);
+            t.last_recover = past;
+            // 마지막 샘플을 낡게 만든다(RTT_STALE_MS 초과).
+            t.last_rtt = t.last_rtt.map(|(rtt, _)| (rtt, past));
+        }
+        assert!(
+            c.poll_target() > 6_000_000,
+            "낡은 RTT 샘플이 회복을 영구히 막았다"
+        );
     }
 }

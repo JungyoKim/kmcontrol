@@ -356,6 +356,40 @@ impl FrameFecStatus {
     }
 }
 
+/// 비디오/오디오 UDP 소켓의 클라이언트 등록 겸 keepalive 핑.
+///
+/// 호스트는 이 4바이트를 받은 소스 주소를 스트림 목적지로 등록하고, 3초간 끊기면 인코딩을
+/// 멈춘다(`kmc-streamhost/src/video/mod.rs`). 클라이언트 쪽 NAT 는 이 패킷으로 스스로 뚫린다.
+pub const PING_PAYLOAD: &[u8; 4] = b"PING";
+
+/// RTT 프로브 태그. 호스트가 PING 에 대한 답으로 `PONG_TAG + u64(호스트 단조시계 마이크로초)`
+/// 를 되쏘고, 클라이언트는 받은 12바이트를 **그대로** 되돌려보낸다.
+///
+/// 타임스탬프를 찍는 쪽과 RTT 를 계산하는 쪽이 모두 호스트이므로 **시계 동기화가 필요 없다**.
+/// 클라이언트는 상태를 전혀 갖지 않는다(순수 에코).
+pub const PONG_TAG: &[u8; 4] = b"PONG";
+
+/// RTT 프로브 데이터그램 크기(태그 4 + u64 타임스탬프 8).
+pub const RTT_PROBE_SIZE: usize = 12;
+
+/// RTT 프로브 데이터그램을 만든다. `micros` 는 호스트의 단조시계 기준 경과 마이크로초.
+pub fn rtt_probe(micros: u64) -> [u8; RTT_PROBE_SIZE] {
+    let mut buf = [0u8; RTT_PROBE_SIZE];
+    buf[..4].copy_from_slice(PONG_TAG);
+    buf[4..].copy_from_slice(&micros.to_le_bytes());
+    buf
+}
+
+/// 되돌아온 RTT 프로브에서 타임스탬프를 꺼낸다. 프로브가 아니면 `None`.
+///
+/// 실제 미디어 shard 는 최소 [`PAYLOAD_OFFSET`] 바이트라 12바이트 프로브와 절대 겹치지 않는다.
+pub fn parse_rtt_probe(buf: &[u8]) -> Option<u64> {
+    if buf.len() != RTT_PROBE_SIZE || &buf[..4] != PONG_TAG {
+        return None;
+    }
+    Some(u64::from_le_bytes(buf[4..].try_into().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +580,26 @@ mod tests {
         assert_eq!(fec_status(0, 0, 0, 0).loss_fraction(), None);
         // 과다 보고여도 음수/overflow 없이 0.0.
         assert_eq!(fec_status(100, 20, 200, 50).loss_fraction(), Some(0.0));
+    }
+
+    #[test]
+    fn rtt_probe_round_trips() {
+        let probe = rtt_probe(1_234_567_890);
+        assert_eq!(probe.len(), RTT_PROBE_SIZE);
+        assert_eq!(&probe[..4], PONG_TAG);
+        assert_eq!(parse_rtt_probe(&probe), Some(1_234_567_890));
+    }
+
+    #[test]
+    fn rtt_probe_rejects_non_probes() {
+        // PING(4B) 은 프로브가 아니다.
+        assert_eq!(parse_rtt_probe(PING_PAYLOAD), None);
+        // 태그가 달라도 거부.
+        let mut wrong = rtt_probe(7);
+        wrong[0] = b'X';
+        assert_eq!(parse_rtt_probe(&wrong), None);
+        // 실제 미디어 shard 는 헤더만으로도 프로브보다 크다 — 길이만으로 갈린다.
+        assert!(PAYLOAD_OFFSET > RTT_PROBE_SIZE);
+        assert_eq!(parse_rtt_probe(&[0u8; PAYLOAD_OFFSET]), None);
     }
 }

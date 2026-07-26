@@ -41,9 +41,9 @@ use kmc_gsproto::{
     MAX_SHARDS, PAYLOAD_OFFSET, RTP_VERSION_FLAGS, VIDEO_FRAME_HEADER_SIZE,
 };
 
-/// 호스트가 클라이언트 주소 등록 신호로 받아들이는 유일한 payload
-/// (`kmc-streamhost/src/video/mod.rs`: `if &recv_buf[..len] == b"PING"`).
-pub const PING_PAYLOAD: &[u8] = b"PING";
+/// 호스트가 클라이언트 주소 등록 신호로 받아들이는 유일한 payload. 정의는 공용 크레이트에
+/// 있다(`kmc-gsproto`) — 호스트와 클라이언트가 같은 상수를 본다.
+pub const PING_PAYLOAD: &[u8] = kmc_gsproto::PING_PAYLOAD;
 
 /// PING 송신 주기. 호스트는 3초 무소식이면 인코딩을 멈추므로 6배 여유를 둔다
 /// (moonlight-common-c `VideoStream.c` 의 ping 스레드와 같은 500ms).
@@ -553,6 +553,14 @@ pub async fn run(
                 Ok((len, from)) => {
                     if from.ip() != host_video_addr.ip() {
                         continue; // 호스트가 아닌 곳에서 온 패킷.
+                    }
+                    // RTT 프로브는 손대지 않고 그대로 되돌려준다. 타임스탬프는 호스트 시계라
+                    // 우리는 해석하지 않으며, 상태도 갖지 않는다(순수 에코).
+                    if kmc_gsproto::parse_rtt_probe(&buf[..len]).is_some() {
+                        if let Err(e) = socket.send_to(&buf[..len], host_video_addr).await {
+                            tracing::trace!(error = %e, "rtt echo send failed");
+                        }
+                        continue;
                     }
                     dp.push(&buf[..len], Instant::now());
                 }
@@ -1117,6 +1125,64 @@ mod tests {
 
         shutdown.store(true, Ordering::Relaxed);
         // shutdown 은 다음 이벤트(PING 틱 ≤ 500ms) 때 관측된다.
+        tokio::time::timeout(PING_INTERVAL * 4, task).await.unwrap().unwrap().unwrap();
+    }
+
+    /// 호스트가 PING 응답에 실어 보내는 RTT 프로브를 클라이언트가 그대로 되돌려주는지,
+    /// 그리고 그게 미디어 경로를 오염시키지 않는지 — 실제 `run` 루프로 확인한다.
+    #[tokio::test]
+    async fn run_echoes_rtt_probe_without_disturbing_media() {
+        let host = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let host_addr = host.local_addr().unwrap();
+
+        let (au_tx, au_rx) = std::sync::mpsc::channel();
+        let (fec_tx, _fec_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (lost_tx, _lost_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let task = tokio::spawn(run(
+            "127.0.0.1:0".parse().unwrap(),
+            host_addr,
+            au_tx,
+            fec_tx,
+            lost_tx,
+            shutdown.clone(),
+        ));
+
+        let mut buf = [0u8; 256];
+        let (n, client) = tokio::time::timeout(Duration::from_secs(3), host.recv_from(&mut buf))
+            .await
+            .expect("PING 이 안 왔다")
+            .unwrap();
+        assert_eq!(&buf[..n], PING_PAYLOAD);
+
+        // 호스트 시계 기준 타임스탬프를 실어 보낸다(호스트 코드와 같은 함수).
+        let epoch = std::time::Instant::now();
+        let probe = kmc_gsproto::rtt_probe(epoch.elapsed().as_micros() as u64);
+        host.send_to(&probe, client).await.unwrap();
+
+        // 에코는 바이트 단위로 동일해야 한다 — 호스트가 자기 타임스탬프를 되읽는다.
+        let (n, from) = tokio::time::timeout(Duration::from_secs(3), host.recv_from(&mut buf))
+            .await
+            .expect("RTT 에코가 안 왔다")
+            .unwrap();
+        assert_eq!(from, client);
+        assert_eq!(&buf[..n], &probe[..], "프로브가 변형됐다");
+        let sent_us = kmc_gsproto::parse_rtt_probe(&buf[..n]).expect("호스트가 못 읽는 에코");
+        assert!(epoch.elapsed().as_micros() as u64 >= sent_us, "왕복이 음수다");
+
+        // 프로브가 디패킷타이저에 새지 않았는지: 그 뒤 정상 프레임이 그대로 온다.
+        let nal = make_nal(3000, 99);
+        for s in packetize(&nal, true, 1024, 1, 20) {
+            host.send_to(&s, client).await.unwrap();
+        }
+        let au = tokio::task::spawn_blocking(move || au_rx.recv_timeout(Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .expect("AU 가 안 왔다");
+        assert_eq!(&au.data[1..], &nal[..]);
+
+        shutdown.store(true, Ordering::Relaxed);
         tokio::time::timeout(PING_INTERVAL * 4, task).await.unwrap().unwrap().unwrap();
     }
 
