@@ -45,8 +45,23 @@ impl Identity {
     }
 }
 
-/// GameStream 관례 RTSP 포트. 호스트 `HostConfig::rtsp_port` 의 기본값과 같다.
+pub use kmc_gsproto::{ports_from_base, DEFAULT_BASE_PORT};
+
+/// GameStream 관례 RTSP 포트 = `ports_from_base(DEFAULT_BASE_PORT).2`.
+/// 저장된 옛 `PairedHost` 레코드를 채우는 기본값으로만 쓴다.
 pub const DEFAULT_RTSP_PORT: u16 = 48010;
+
+/// `host` 또는 `host:base_port` 를 분리한다. 포트가 없거나 파싱 실패면 기본 베이스.
+/// IPv6 리터럴(`fd7a:...`)을 포트로 오독하지 않도록 호스트 쪽에 `:` 가 남으면 무시한다.
+pub fn split_host_base(address: &str) -> (&str, u16) {
+    match address.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => match port.parse::<u16>() {
+            Ok(p) if p != 0 => (host, p),
+            _ => (address, DEFAULT_BASE_PORT),
+        },
+        _ => (address, DEFAULT_BASE_PORT),
+    }
+}
 
 fn default_rtsp_port() -> u16 {
     DEFAULT_RTSP_PORT
@@ -331,4 +346,37 @@ pub fn launch(
         rikey,
         rikey_iv,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_port_derives_the_gamestream_offsets() {
+        assert_eq!(ports_from_base(DEFAULT_BASE_PORT), (47989, 47984, 48010));
+        assert_eq!(ports_from_base(48989), (48989, 48984, 49010));
+    }
+
+    #[test]
+    fn address_without_port_uses_the_default_base() {
+        assert_eq!(split_host_base("100.127.176.115"), ("100.127.176.115", DEFAULT_BASE_PORT));
+    }
+
+    #[test]
+    fn address_with_port_overrides_the_base() {
+        assert_eq!(split_host_base("127.0.0.1:48989"), ("127.0.0.1", 48989));
+    }
+
+    #[test]
+    fn ipv6_literal_is_not_mistaken_for_a_port() {
+        // 마지막 그룹이 u16 로 파싱되더라도 호스트로 남아야 한다.
+        assert_eq!(split_host_base("fd7a:115c::1"), ("fd7a:115c::1", DEFAULT_BASE_PORT));
+    }
+
+    #[test]
+    fn junk_or_zero_port_falls_back_instead_of_failing() {
+        assert_eq!(split_host_base("host:abc"), ("host:abc", DEFAULT_BASE_PORT));
+        assert_eq!(split_host_base("host:0"), ("host:0", DEFAULT_BASE_PORT));
+    }
 }

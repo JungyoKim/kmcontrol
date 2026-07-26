@@ -52,6 +52,17 @@ pub mod rtp_flag {
     pub const START_OF_FRAME: u8 = 0x4;
 }
 
+/// GameStream 기본 베이스 포트(HTTP). 나머지 포트는 여기서 고정 오프셋으로 파생한다 —
+/// Sunshine 의 `port` 설정과 같은 규약이라 Moonlight 클라이언트가 그대로 붙는다.
+pub const DEFAULT_BASE_PORT: u16 = 47989;
+
+/// 베이스 포트 → `(http, https, rtsp)`. 오프셋: https = base-5, rtsp = base+21.
+/// 미디어 포트(video/control/audio)는 RTSP SETUP 으로 협상하므로 여기 없다.
+#[inline]
+pub fn ports_from_base(base: u16) -> (u16, u16, u16) {
+    (base, base.wrapping_sub(5), base.wrapping_add(21))
+}
+
 /// 데이터그램 길이에서 shard payload 길이를 역산한다.
 ///
 /// 송신 측은 `shard_payload_len = packet_size - NV_VIDEO_PACKET_SIZE` 로 잡으므로

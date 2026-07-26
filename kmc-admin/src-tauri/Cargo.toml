@@ -34,3 +34,9 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# 라이브 팬아웃 테스트(tests/live_fanout.rs)용 — 통합 테스트는 dev-deps 만 링크한다.
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"

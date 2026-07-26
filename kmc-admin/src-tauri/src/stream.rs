@@ -61,7 +61,10 @@ impl StreamState {
             let _ = std::fs::create_dir_all(parent);
         }
         let identity = Identity::load_or_generate(&id_path)?;
-        let (http, https) = (47989u16, 47984u16);
+        // `address` 는 `host` 또는 `host:base_port` — 베이스가 다르면 http/https/rtsp 가 함께
+        // 옮겨간다(같은 머신에 Sunshine 등이 표준 포트를 쥐고 있을 때 필요).
+        let (address, base) = pair::split_host_base(address);
+        let (http, https, rtsp_port) = pair::ports_from_base(base);
 
         let info = pair::query_server_info(&identity, address, http, https)?;
         // 페어링 제거: 호스트가 모든 클라를 신뢰하므로 address/포트만으로 바로 launch한다.
@@ -71,7 +74,7 @@ impl StreamState {
             address: address.to_string(),
             http_port: http,
             https_port: https,
-            rtsp_port: pair::DEFAULT_RTSP_PORT,
+            rtsp_port,
             server_cert_pem: String::new(),
         };
 

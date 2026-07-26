@@ -1,8 +1,10 @@
 //! 순수 Rust 클라이언트 E2E 스모크: 실제 `kmc-streamhost` 에 붙어 비디오/오디오를 받는다.
 //!
 //! ```text
-//! streamhost-host-test                          # 다른 창에서 호스트 기동
-//! cargo run --example stream_smoke 127.0.0.1 10
+//! streamhost-host-test                     # 다른 창에서 호스트 기동
+//! cargo run --example stream_smoke 127.0.0.1 10        # 기본 포트
+//! KMC_BASE_PORT=48989 streamhost-host-test             # 표준 포트가 막혀 있을 때
+//! cargo run --example stream_smoke 127.0.0.1:48989 10
 //! ```
 //!
 //! 검증 항목(하나라도 실패하면 exit 1):
@@ -27,11 +29,11 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let address = args.next().unwrap_or_else(|| "127.0.0.1".into());
     let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
-    // 포트 베이스. GameStream 관례는 47989(http)/47984(https)/48010(rtsp) 이지만, 같은 머신에
-    // Sunshine 등이 떠 있으면 비켜서 띄워야 한다 - 호스트도 HostConfig 로 옮길 수 있다.
-    let http: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(47989);
-    let https: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(47984);
-    let rtsp_port: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(48010);
+    // 같은 머신에 Sunshine 등 다른 GameStream 호스트가 표준 포트를 쥐고 있으면 베이스를 옮긴다
+    // (호스트는 `KMC_BASE_PORT` 로 같은 오프셋을 따라간다).
+    let (address, base) = pair::split_host_base(&address);
+    let base = args.next().and_then(|s| s.parse().ok()).unwrap_or(base);
+    let (http, https, rtsp_port) = pair::ports_from_base(base);
     let allow_hevc = std::env::var("KMC_HEVC").is_ok();
 
     let id_path = std::env::temp_dir().join("kmc-smoke-identity.json");
@@ -47,7 +49,7 @@ fn main() -> Result<()> {
     );
 
     let host = pair::PairedHost {
-        address: address.clone(),
+        address: address.to_string(),
         http_port: http,
         https_port: https,
         rtsp_port,

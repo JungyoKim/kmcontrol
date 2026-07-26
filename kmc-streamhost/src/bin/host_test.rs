@@ -20,16 +20,12 @@ async fn main() -> Result<()> {
         default_hook(info);
     }));
 
-    // 같은 머신에 Sunshine 등 다른 GameStream 호스트가 떠 있으면 포트를 비켜 띄운다.
+    // 같은 머신에 Sunshine 등 다른 GameStream 호스트가 떠 있으면 베이스 포트를 옮겨 띄운다
+    // (클라이언트도 `주소:베이스` 로 같은 오프셋을 따라온다).
     let mut config = kmc_streamhost::host::HostConfig::default();
-    if let Ok(p) = std::env::var("KMC_HTTP_PORT") {
-        config.http_port = p.parse()?;
-    }
-    if let Ok(p) = std::env::var("KMC_HTTPS_PORT") {
-        config.https_port = p.parse()?;
-    }
-    if let Ok(p) = std::env::var("KMC_RTSP_PORT") {
-        config.rtsp_port = p.parse()?;
+    if let Ok(base) = std::env::var("KMC_BASE_PORT") {
+        let (http, https, rtsp) = kmc_gsproto::ports_from_base(base.parse()?);
+        (config.http_port, config.https_port, config.rtsp_port) = (http, https, rtsp);
     }
     tracing::info!(config.http_port, config.https_port, config.rtsp_port, "ports");
     let rtsp = kmc_streamhost::host::start(config).await?;
