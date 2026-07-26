@@ -11,12 +11,23 @@
 #>
 [CmdletBinding()]
 param(
-  [string]$AgentExe  = "$PSScriptRoot\..\kmc-agent\target\release\kmc-agent.exe",
-  [string]$FfmpegBin = $(if ($env:FFMPEG_DIR) { Join-Path $env:FFMPEG_DIR 'bin' } else { "$env:USERPROFILE\ffmpeg-7.1-shared\bin" }),
-  [string]$Out       = "$PSScriptRoot\kmc-agent-bundle.zip"
+  [string]$AgentExe,
+  [string]$FfmpegBin,
+  [string]$Out
 )
 
 $ErrorActionPreference = 'Stop'
+
+# [CmdletBinding()] 가 붙으면 param 기본값이 평가되는 시점에 $PSScriptRoot 가 아직 비어
+# 있다(본문에서는 정상). 실측: 기본값 "$PSScriptRoot\..\x" -> "\..\x" 로 평가돼
+# `powershell -File deploy\build-release-bundle.ps1` 이 항상 "agent 미빌드" 로 죽었다.
+# 그래서 스크립트 상대 경로 기본값은 반드시 본문에서 채운다.
+if (-not $AgentExe)  { $AgentExe  = Join-Path $PSScriptRoot '..\kmc-agent\target\release\kmc-agent.exe' }
+if (-not $Out)       { $Out       = Join-Path $PSScriptRoot 'kmc-agent-bundle.zip' }
+if (-not $FfmpegBin) {
+  $FfmpegBin = if ($env:FFMPEG_DIR) { Join-Path $env:FFMPEG_DIR 'bin' } else { "$env:USERPROFILE\ffmpeg-7.1-shared\bin" }
+}
+
 if (-not (Test-Path $AgentExe))  { throw "agent 미빌드: $AgentExe (cargo build --release -p kmc-agent 먼저)" }
 if (-not (Test-Path $FfmpegBin)) { throw "ffmpeg bin 없음: $FfmpegBin (FFMPEG_DIR 로 지정 가능)" }
 
