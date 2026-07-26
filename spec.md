@@ -187,6 +187,6 @@
 - **스트리밍 페어링 제거**: 자체 스택 + hub 세션 인증이라 PIN 페어링 불필요(호스트가 모든 클라 신뢰).
 
 ### ❌ 남은 것
-- **Tailscale 잔여(핵심은 검증 완료, 위 표)**: ① admin 앱의 "네이티브 Tailscale 미설치 시 안내" UX 미구현; ② ACL 연결규칙(노트북↔노트북 격리, admin→노트북 스트리밍 포트만 허용)의 **실발효**는 hub/admin/노트북이 각각 별도 tailnet 노드인 다중노드 배치에서만 실측 가능(단일머신 테스트 미검, 정책 파일은 작성됨).
+- **Tailscale 잔여(핵심은 검증 완료, 위 표)**: ① admin 앱의 "네이티브 Tailscale 미설치 시 안내" UX **미구현**(실측: `kmc-admin` 코드에 tailscale 참조가 `tailscale_addr` 타입/세션주소용뿐); ② ACL 연결규칙(노트북↔노트북 격리, admin→노트북 스트리밍 포트만 허용)의 **실발효 미측정** — 정책 파일 `deploy/tailscale-acl.hujson` 은 작성됐고 hub/admin/노트북이 각각 별도 tailnet 노드로 라이브 동작 중이나, 격리가 실제로 먹는지는 따로 측정한 적 없음.
 - **web-client + streaming-bridge**: 사양상 범위 밖.
-- **일반 설치형 = irm|iex 로 구현·검증**(위 표): 실제 배포엔 ① `kmc-agent-bundle.zip` 을 공개 호스트(GitHub Releases)에 업로드, ② `install.ps1` 의 `ReleaseUrl` 을 실 URL 로 확정, ③ 관리자 환경에서 Tailscale MSI 경로 실검증 이 남음. MSI/NSIS 는 미채용(불필요). WTG 는 보류.
+- **릴리스 번들 갱신(현재 유일한 실배포 블로커)**: `ReleaseUrl` 은 실 URL 확정 완료(`.../releases/latest/download/kmc-agent-bundle.zip`)이고 릴리스 `v0.1.0` 도 게시돼 있으나, **자산 zip 이 2026-07-24 14:41 판이라 낡았다**. 이후 agent 바이너리에 들어가는 커밋 6건(지연기반 혼잡제어, loss EWMA 프레임레이트 독립화, 순수 Rust GameStream 클라, agent 런타임 `tailscale up` 제거, IDR churn 감소)이 미반영. `install.ps1` 은 raw GitHub 에서 직접 받으므로 push 즉시 반영되지만 **zip 은 재빌드·재업로드가 필요**하다: `deploy/build-release-bundle.ps1` → `gh release upload v0.1.0 --clobber`. MSI/NSIS 는 미채용(불필요). WTG 는 보류.
