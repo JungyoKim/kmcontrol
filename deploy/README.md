@@ -66,7 +66,7 @@ powershell -File deploy\build-release-bundle.ps1   # → deploy\kmc-agent-bundle
 > **ffmpeg DLL 번들이 필수**: agent 는 streamhost(ffmpeg) 를 링크하므로 DLL 이 없으면 로더 단계에서
 > 즉사(exit 53)한다. 번들은 DLL 을 exe 옆에 두어 PATH 조작 없이 로드되게 한다(검증됨).
 
-### 노트북에서 설치 (관리자 PowerShell 권장)
+### 노트북에서 설치 (일반 PowerShell 로 실행 — Tailscale 단계만 UAC)
 
 **한 줄 설치** — 값이 없으면 스크립트가 대화형으로 물어본다(hub URL, authkey):
 ```powershell
@@ -84,7 +84,16 @@ $env:KMC_HUB_URL="http://<hub-tailnet-ip>:8080"; $env:KMC_TS_AUTHKEY="tskey-auth
 3. **완전 무입력**을 원하면 hub 가 콘솔에서 authkey 를 박은 개인화 스크립트를 발급하는 방식(Tailscale 콘솔의 "복사된 명령" 모델)으로 확장 가능(hub enroll 엔드포인트 필요, 미구현).
    → Claude Code 류의 무인자 한 줄은 "per-install 비밀이 없어서" 가능한 것이고, 우리는 tailnet authkey 라는 비밀이 있어 위 중 하나로 전달해야 한다.
 - **무권한으로 되는 것**: agent(+DLL) 설치(`%LOCALAPPDATA%\kmc`), cua-driver, 사용자 env, `HKCU\...\Run` 자동시작, agent 기동.
-- **관리자 필요**: Tailscale(서비스+WinTun 드라이버) 설치 + operator 지정. 관리자 PS 로 실행하면 원샷, 아니면 이 단계만 건너뛰고 안내(agent 는 LAN 동작, TS 는 나중에 관리자로).
+- **관리자 필요**: Tailscale(서비스+WinTun 드라이버) 설치 + `up` 등록. 이 단계만 별도 자식
+  프로세스로 **UAC 승격**되고, 거부하면 그 단계만 건너뛴다(agent 는 LAN/hub 로 계속 동작).
+  스크립트 전체를 승격하면 안 된다 — UAC 에서 다른 관리자 계정으로 인증하면
+  `%LOCALAPPDATA%`/`HKCU` 가 그 계정으로 바뀌어 agent 가 엉뚱한 프로필에 설치된다.
+  결과 판정은 "exe 존재"가 아니라 **`BackendState=Running`** 이며, 로그는
+  `%LOCALAPPDATA%\kmc\tailscale-setup.log`. 종료코드 0=연결, 2=설치됐지만 미연결, 3=설치 실패.
+- **트레이 아이콘 숨김**: `tailscaled` 는 LocalSystem 서비스라 학생(비관리자)이 정지할 수 없지만
+  (실측: `sc stop` 거부), `tailscale-ipn.exe` 는 사용자 세션 프로세스라 눈에 띄고 종료 가능하다.
+  죽여도 `--unattended` 라 tailnet 은 유지되므로(실측: kill 15초 뒤에도 `Running` + 100.x 유지)
+  공용 시작폴더의 `Tailscale.lnk` 를 제거해 아이콘만 없앤다. 유지하려면 `-KeepTailscaleTray`.
 - **네트워크 순서**: 공개 호스트에서 스크립트/번들 받기 → (authkey 로) Tailscale 부트스트랩 → agent 가 tailnet 으로 hub 연결. 그래서 번들은 tailnet-only hub 가 아니라 **공개 호스트**에 둔다.
 - 갱신: 같은 명령 재실행(실행 중 agent 종료 후 덮어씀). 제거: `HKCU Run` 의 `kmc-agent` 삭제 + `%LOCALAPPDATA%\kmc` 삭제.
 

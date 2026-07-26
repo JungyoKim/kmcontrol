@@ -49,26 +49,85 @@ for ($i = 0; $i -lt 30; $i++) {
 Log "network_ready=$net"
 
 # ---- 2. Tailscale 설치 + up ----
+# 모든 단계의 성패를 명시적으로 판정한다. 예전엔 다운로드/msiexec/up 어느 하나가 실패해도
+# 조용히 통과해 "설치는 됐다는데 tailnet 에 안 붙은" 상태로 끝났다.
+# (install.ps1 과 같은 로직. 둘 다 단독 실행 스크립트라 공유 모듈을 둘 수 없어 복제한다.)
 $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+
+# BackendState 를 읽는다. 미설치/서비스 미기동/파싱 실패면 $null.
+# 네이티브 exe 는 실패해도 throw 하지 않으므로 반드시 종료코드로 판정해야 한다.
+function Get-TsState {
+    if (-not (Test-Path $tsExe)) { return $null }
+    try {
+        $out = & $tsExe status --json 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return (($out -join "`n") | ConvertFrom-Json).BackendState
+    } catch { return $null }
+}
+
+# tailscaled 가 응답할 때까지 최대 $Seconds 대기. MSI 직후 서비스 등록·기동에 시간이 걸리는데
+# 예전엔 대기가 아예 없어 곧바로 이어지는 up 이 조용히 죽었다.
+function Wait-TsBackend([int]$Seconds) {
+    for ($i = 0; $i -lt $Seconds; $i++) {
+        if (Get-TsState) { return $true }
+        Start-Sleep 1
+    }
+    return $false
+}
+
 if (-not (Test-Path $tsExe)) {
     $msi = Join-Path $KmcDir 'tailscale.msi'
-    if (-not (Test-Path $msi)) {
+    $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+    # 이미지에 미리 담아둔 MSI 가 있으면 그대로 쓴다(오프라인/느린 첫 부팅 대비).
+    if ((Test-Path $msi) -and (Get-Item $msi).Length -lt 5MB) {
+        Log "cached tailscale.msi too small ($((Get-Item $msi).Length) bytes) - discarding"
+        Remove-Item $msi -ErrorAction SilentlyContinue
+    }
+    for ($try = 1; $try -le 3 -and -not (Test-Path $msi); $try++) {
         try {
-            Log "downloading tailscale msi"
-            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi -UseBasicParsing
-        } catch { Log "tailscale download failed: $_" }
+            Log "downloading tailscale msi ($try/3)"
+            Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing -TimeoutSec 180
+            # MSI 는 수십 MB. 캡티브 포털/프록시가 끼워넣는 차단 페이지는 몇 KB 라 여기서 걸린다.
+            $size = (Get-Item $msi).Length
+            if ($size -lt 5MB) { throw "downloaded $size bytes - captive portal page?" }
+        } catch {
+            Log "tailscale download failed ($try/3): $_"
+            Remove-Item $msi -ErrorAction SilentlyContinue
+            Start-Sleep (2 * $try)
+        }
     }
     if (Test-Path $msi) {
         Log "installing tailscale (msiexec /qn)"
-        Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
+        # 0=성공, 3010=설치됨(재부팅 권고). 그 외는 실패인데 예전엔 종료코드를 안 봤다.
+        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+        if ($p.ExitCode -notin 0, 3010) { Log "msiexec failed (exit=$($p.ExitCode))" }
     }
 }
 if ((Test-Path $tsExe) -and $AuthKey) {
+    if (-not (Wait-TsBackend 30)) { Log "tailscaled unresponsive after 30s - trying up anyway" }
     Log "tailscale up (advertise-tags=tag:camp-laptop, unattended)"
+    # hostname 은 계정 이름을 받은 뒤 4b 에서 set 한다(여기선 아직 모른다).
     & $tsExe up --authkey=$AuthKey --advertise-tags=tag:camp-laptop --unattended 2>&1 | ForEach-Object { Log "ts: $_" }
+    if ($LASTEXITCODE -ne 0) { Log "tailscale up failed (exit=$LASTEXITCODE) - authkey expired / tag not authorized?" }
+    # 성공 기준은 "exe 가 있다"가 아니라 "tailnet 에 붙었다"이다. agent 의 Hello 가 100.x 를
+    # 못 실으면 hub 가 프록시 내부 IP 로 폴백해 스트리밍이 통째로 깨진다.
+    $state = $null
+    for ($i = 0; $i -lt 20 -and $state -ne 'Running'; $i++) {
+        $state = Get-TsState
+        if ($state -ne 'Running') { Start-Sleep 1 }
+    }
+    if ($state -eq 'Running') { Log "tailscale connected ip=$((& $tsExe ip -4 2>$null | Select-Object -First 1))" }
+    else { Log "tailscale NOT connected (BackendState=$state) - streaming unavailable" }
 } else {
     Log "skip tailscale up (exe_present=$([bool](Test-Path $tsExe)) authkey_present=$([bool]$AuthKey))"
 }
+
+# 트레이 아이콘 제거. tailscaled 는 LocalSystem 서비스라 학생(비관리자)이 정지할 수 없지만,
+# tailscale-ipn.exe 는 사용자 세션 프로세스라 눈에 띄고 종료할 수 있다. 종료해도 --unattended
+# 라 tailnet 은 유지되므로(실측 확인) 아이콘만 없애면 된다. 자동시작 경로는 공용 시작폴더
+# 바로가기 하나뿐이다. WTG 이미지는 학생에게 넘어가므로 여기선 항상 제거한다.
+$tsLnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup\Tailscale.lnk'
+if (Test-Path $tsLnk) { Remove-Item $tsLnk -Force -ErrorAction SilentlyContinue; Log "removed tailscale tray autostart" }
 
 # ---- 3. agent 실행 → /provision → 계정 이름 ----
 # agent 바이너리는 이미지의 C:\kmc\kmc-agent.exe 에 배치. --provision-only 모드로 이름만 획득.
@@ -101,14 +160,14 @@ if (-not (Get-LocalUser -Name $accountName -ErrorAction SilentlyContinue)) {
     } catch { Log "New-LocalUser failed: $_" }
 }
 
-# ---- 4b. Tailscale operator + hostname (학생 계정이 런타임에 tailscale status/ip 조회 가능하도록) ----
-# 설치·operator 지정·up 은 여기(SYSTEM=admin)서 1회. agent(비관리자)는 조회만 하고 up 은 안 한다.
-if (Test-Path $tsExe) {
-    & $tsExe set --operator="$env:COMPUTERNAME\$accountName" 2>&1 | ForEach-Object { Log "ts-operator: $_" }
-    if ($AuthKey) {
-        & $tsExe up --authkey=$AuthKey --advertise-tags=tag:camp-laptop --hostname=$accountName --unattended 2>&1 | ForEach-Object { Log "ts-hostname: $_" }
-    }
-    Log "tailscale operator=$accountName hostname=$accountName"
+# ---- 4b. Tailscale hostname (계정 이름과 일치시켜 admin 목록에서 식별) ----
+# `set --operator` 는 Linux 전용(비-root CLI 허용)이라 Windows 에선 무의미해 제거했다.
+# Windows 는 tailscaled 가 LocalSystem 서비스고 비관리자도 status/ip 조회가 된다.
+# up 을 두 번 부르지 않고 hostname 만 갱신한다.
+if ((Test-Path $tsExe) -and (Get-TsState)) {
+    & $tsExe set --hostname=$accountName 2>&1 | ForEach-Object { Log "ts-hostname: $_" }
+    if ($LASTEXITCODE -ne 0) { Log "tailscale set --hostname failed (exit=$LASTEXITCODE)" }
+    else { Log "tailscale hostname=$accountName" }
 }
 
 # ---- 5. 자동 로그인 (Winlogon) ----

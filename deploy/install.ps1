@@ -1,7 +1,8 @@
 <#
   kmc-agent 일반 설치형 원격 설치 스크립트 (irm | iex).
 
-  사용법 — 관리자 PowerShell 권장(Tailscale 설치에 관리자 필요; 나머지는 무권한 가능):
+  사용법 — 일반 PowerShell 로 실행해도 된다. Tailscale 단계에서만 UAC 승인 창이 한 번 뜨고,
+  거부하면 그 단계만 건너뛴다(제어는 hub 로 계속 동작, 원격 스트리밍만 불가):
 
     $env:KMC_HUB_URL    = "http://<hub-tailnet-ip>:8080"
     $env:KMC_TS_AUTHKEY = "tskey-auth-..."     # (선택) 없으면 Tailscale 단계 생략, LAN으로 동작
@@ -14,7 +15,8 @@
     1. kmc-agent + ffmpeg 런타임 DLL 번들 다운로드·설치 (%LOCALAPPDATA%\kmc, 무권한)
        — ffmpeg DLL 을 exe 옆에 두어 PATH 조작 없이 로드되게 함.
     2. cua-driver(GUI/브라우저 자동화 백엔드) 없으면 설치 시도 (무권한, best-effort)
-    3. (authkey 제공 + 관리자) Tailscale 없으면 MSI 설치 + operator 지정
+    3. (authkey 제공) Tailscale 없으면 MSI 설치 + `up --unattended` 등록 — 이 단계만 UAC 승격.
+       트레이 아이콘도 숨긴다(-KeepTailscaleTray 로 유지). 로그: <InstallDir>\tailscale-setup.log
     4. agent 용 사용자 환경변수 + 로그온 자동시작(HKCU Run) 등록
     5. agent 즉시 기동
 #>
@@ -23,7 +25,8 @@ param(
   [string]$HubUrl     = $env:KMC_HUB_URL,
   [string]$AuthKey    = $env:KMC_TS_AUTHKEY,
   [string]$ReleaseUrl = $(if ($env:KMC_RELEASE_URL) { $env:KMC_RELEASE_URL } else { 'https://github.com/JungyoKim/kmcontrol/releases/latest/download/kmc-agent-bundle.zip' }),
-  [string]$InstallDir = $(if ($env:KMC_INSTALL_DIR) { $env:KMC_INSTALL_DIR } else { "$env:LOCALAPPDATA\kmc" })
+  [string]$InstallDir = $(if ($env:KMC_INSTALL_DIR) { $env:KMC_INSTALL_DIR } else { "$env:LOCALAPPDATA\kmc" }),
+  [switch]$KeepTailscaleTray
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,33 +69,142 @@ if (-not (Test-Path $cua)) {
   try { irm $cuaUrl | iex } catch { Warn "cua-driver 설치 실패(나중에 수동 설치 가능): $_" }
 }
 
-# ---- 3. Tailscale (authkey 제공 + 관리자) ----
-# Windows 는 tailscaled 가 시스템 서비스라 --operator 불필요(Linux 전용). 관리자 컨텍스트에서
-# 직접 `tailscale up --auth-key ... --unattended` 로 등록한다. agent 는 `up` 을 절대 부르지
-# 않는다(비관리자 up = UAC/로그인 GUI → 기동마다 권한 창). --unattended 라 재부팅 후에도
+# ---- 3. Tailscale (authkey 제공 시) ----
+# Windows 는 tailscaled 가 LocalSystem 서비스라 --operator 불필요(Linux 전용). 관리자
+# 컨텍스트에서 `tailscale up --auth-key ... --unattended` 로 등록한다. agent 는 `up` 을 절대
+# 부르지 않는다(비관리자 up = UAC/로그인 GUI → 기동마다 권한 창). --unattended 라 재부팅 후에도
 # tailscaled 가 스스로 재연결하므로 런타임 재-up 자체가 불필요하다.
+#
+# 이 단계만 별도 스크립트로 떼어 필요할 때 UAC 승격한다. **스크립트 전체를 승격하면 안 된다** -
+# UAC 에서 다른 관리자 계정으로 인증하면 $env:LOCALAPPDATA 와 HKCU 가 그 계정으로 바뀌어
+# agent 가 엉뚱한 프로필에 설치된다. 번들·환경변수·자동시작은 학생 계정 컨텍스트가 필수다.
+#
+# 자식 스크립트는 모든 단계의 성패를 명시적으로 판정한다. 예전엔 다운로드/msiexec/up 어느
+# 하나가 실패해도 조용히 통과해 "설치는 됐다는데 tailnet 에 안 붙은" 노트북이 나왔다.
+$tsSetup = @'
+param([Parameter(Mandatory)][string]$AuthKey, [string]$LogPath, [switch]$KeepTray)
+$ErrorActionPreference = 'Continue'
+function Log($m) {
+  $line = "$([DateTime]::UtcNow.ToString('s'))Z  $m"
+  Write-Host $line
+  if ($LogPath) { try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {} }
+}
 $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
-if ($AuthKey) {
-  if (-not (Test-Path $tsExe)) {
-    if ($isAdmin) {
-      Info 'installing Tailscale (MSI, 관리자)'
-      $msi = Join-Path $env:TEMP 'tailscale.msi'
-      Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi -UseBasicParsing
-      Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
+
+# BackendState 를 읽는다. 미설치/서비스 미기동/파싱 실패면 $null.
+# 네이티브 exe 는 실패해도 throw 하지 않으므로 반드시 종료코드로 판정해야 한다.
+function Get-TsState {
+  if (-not (Test-Path $tsExe)) { return $null }
+  try {
+    $out = & $tsExe status --json 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return (($out -join "`n") | ConvertFrom-Json).BackendState
+  } catch { return $null }
+}
+
+# tailscaled 가 응답할 때까지 최대 $Seconds 대기. MSI 직후 서비스 등록·기동에 시간이 걸린다.
+# 예전 루프는 `try { & $tsExe status | Out-Null; break }` 였는데 네이티브 호출이 throw 하지
+# 않아 첫 회에 무조건 break - 이름만 20초 대기였고 실제로는 0초였다(실측 0.02s).
+function Wait-TsBackend([int]$Seconds) {
+  for ($i = 0; $i -lt $Seconds; $i++) {
+    if (Get-TsState) { return $true }
+    Start-Sleep 1
+  }
+  return $false
+}
+
+if (-not (Test-Path $tsExe)) {
+  $msi = Join-Path $env:TEMP 'kmc-tailscale.msi'
+  $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+  $got = $false
+  for ($try = 1; $try -le 3 -and -not $got; $try++) {
+    try {
+      Log "downloading Tailscale MSI ($try/3)"
+      Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing -TimeoutSec 180
+      # MSI 는 수십 MB. 학교망 프록시/캡티브 포털이 끼워넣는 차단 페이지는 몇 KB 라 여기서
+      # 걸린다(예전엔 그 HTML 을 msiexec 에 먹여 1620 으로 죽었다).
+      $size = (Get-Item $msi).Length
+      if ($size -lt 5MB) { throw "받은 파일이 $size bytes - 프록시 차단 페이지로 보인다" }
+      $got = $true
+    } catch {
+      Log "Tailscale MSI 다운로드 실패 ($try/3): $_"
       Remove-Item $msi -ErrorAction SilentlyContinue
-    } else {
-      Warn 'Tailscale 미설치 + 비관리자 → 설치 건너뜀. 관리자 PowerShell 로 재실행하세요. (agent 는 그동안 LAN 동작)'
+      Start-Sleep (2 * $try)
     }
   }
-  if ((Test-Path $tsExe) -and $isAdmin) {
-    # MSI 직후 tailscaled 서비스가 뜰 시간을 준다(최대 ~20s).
-    for ($i = 0; $i -lt 20; $i++) {
-      try { & $tsExe status --json 2>$null | Out-Null; break } catch { Start-Sleep 1 }
+  if ($got) {
+    Log 'installing Tailscale (msiexec /qn)'
+    # 0=성공, 3010=설치됨(재부팅 권고). 그 외는 실패 - 예전엔 종료코드를 안 봐서 1603/1618
+    # 같은 실패에도 그대로 진행했다.
+    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+    if ($p.ExitCode -notin 0, 3010) { Log "msiexec 실패 (exit=$($p.ExitCode))" }
+    Remove-Item $msi -ErrorAction SilentlyContinue
+  }
+}
+if (-not (Test-Path $tsExe)) { Log 'Tailscale 설치 실패'; exit 3 }
+
+if (-not (Wait-TsBackend 30)) { Log 'tailscaled 가 30초 내 무응답 - up 을 그래도 시도한다' }
+Log 'tailscale up (authkey, tag:camp-laptop, unattended)'
+$up = @('up', "--auth-key=$AuthKey", '--advertise-tags=tag:camp-laptop', "--hostname=$env:COMPUTERNAME", '--unattended')
+& $tsExe @up 2>&1 | ForEach-Object { Log "ts: $_" }
+if ($LASTEXITCODE -ne 0) { Log "tailscale up 실패 (exit=$LASTEXITCODE) - authkey 만료/tag 권한 확인" }
+
+# 트레이 아이콘 제거. tailscaled 는 LocalSystem 서비스라 학생(비관리자)이 정지할 수 없지만
+# (실측: sc stop 거부), tailscale-ipn.exe 는 사용자 세션 프로세스라 눈에 띄고 종료할 수 있다.
+# 종료해도 --unattended 라 tailnet 은 그대로 유지되므로(실측: kill 15초 뒤에도 Running +
+# 100.x 유지) 아이콘만 없애면 된다. 자동시작 경로는 공용 시작폴더 바로가기 하나뿐이다.
+if (-not $KeepTray) {
+  $lnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup\Tailscale.lnk'
+  if (Test-Path $lnk) { Remove-Item $lnk -Force -ErrorAction SilentlyContinue }
+  Get-Process tailscale-ipn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  Log '트레이 아이콘 숨김(자동시작 제거 + 현재 인스턴스 종료)'
+}
+
+# 성공 기준은 "exe 가 있다"가 아니라 "tailnet 에 붙었다"이다. agent 의 Hello 가 100.x 를
+# 못 실으면 hub 가 프록시 내부 IP 로 폴백해 스트리밍이 통째로 깨진다.
+$state = $null
+for ($i = 0; $i -lt 20 -and $state -ne 'Running'; $i++) {
+  $state = Get-TsState
+  if ($state -ne 'Running') { Start-Sleep 1 }
+}
+if ($state -ne 'Running') { Log "tailnet 미연결 (BackendState=$state)"; exit 2 }
+Log "tailnet 연결됨: $(& $tsExe ip -4 2>$null | Select-Object -First 1)"
+exit 0
+'@
+
+if ($AuthKey) {
+  $tsLog  = Join-Path $InstallDir 'tailscale-setup.log'
+  $tsFile = Join-Path $env:TEMP "kmc-ts-setup-$PID.ps1"
+  Remove-Item $tsLog -ErrorAction SilentlyContinue
+  # PS5.1 의 -Encoding UTF8 은 BOM 을 붙인다. powershell.exe -File 은 BOM 없는 UTF-8 을
+  # ANSI(CP949)로 오독해 한글 문자열에서 구문 오류를 내므로 BOM 이 필요하다.
+  # (이 install.ps1 자체는 `irm | iex` 로 실행돼 HTTP charset 으로 디코드되므로 BOM 금지.)
+  Set-Content -LiteralPath $tsFile -Value $tsSetup -Encoding UTF8
+  $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tsFile`"", '-AuthKey', "`"$AuthKey`"", '-LogPath', "`"$tsLog`"")
+  if ($KeepTailscaleTray) { $psArgs += '-KeepTray' }
+  $exit = $null
+  try {
+    if ($isAdmin) {
+      $exit = (Start-Process powershell.exe -ArgumentList $psArgs -Wait -PassThru -NoNewWindow).ExitCode
+    } else {
+      Info 'Tailscale 설치에 관리자 권한이 필요합니다 - UAC 승인 창이 뜹니다 (거부해도 나머지 설치는 계속됩니다)'
+      $exit = (Start-Process powershell.exe -ArgumentList $psArgs -Wait -PassThru -Verb RunAs).ExitCode
     }
-    Info 'tailscale up (authkey, tag:camp-laptop, unattended)'
-    # 인자를 배열로 넘겨 PowerShell 의 -- 파싱 문제를 피한다.
-    $up = @('up', "--auth-key=$AuthKey", '--advertise-tags=tag:camp-laptop', "--hostname=$env:COMPUTERNAME", '--unattended')
-    & $tsExe @up 2>&1 | ForEach-Object { Info "ts: $_" }
+  } catch {
+    # UAC 취소/거부는 여기로 온다(1223). 치명적이지 않다 - 제어 플레인은 hub 로 계속 동작한다.
+    Warn "Tailscale 단계 건너뜀(권한 승격 실패/취소): $_"
+  } finally {
+    Remove-Item $tsFile -ErrorAction SilentlyContinue
+  }
+  # 자식은 Add-Content -Encoding UTF8 로 썼다. PS5.1 Get-Content 기본값은 ANSI 라
+  # -Encoding UTF8 을 명시하지 않으면 한글이 깨진다.
+  if (Test-Path $tsLog) { Get-Content -LiteralPath $tsLog -Encoding UTF8 | ForEach-Object { Info "ts: $_" } }
+  switch ($exit) {
+    0       { Info 'Tailscale OK (tailnet 연결됨)' }
+    2       { Warn 'Tailscale 설치됐지만 tailnet 미연결 - 원격 스트리밍 불가. authkey/tag 권한을 확인하세요.' }
+    3       { Warn 'Tailscale 설치 실패 - 원격 스트리밍 불가. 제어는 hub 로 계속 동작합니다.' }
+    $null   { Warn 'Tailscale 단계 미실행 - 원격 스트리밍 불가. 제어는 hub 로 계속 동작합니다.' }
+    default { Warn "Tailscale 설치 스크립트 비정상 종료 (exit=$exit)" }
   }
 }
 
