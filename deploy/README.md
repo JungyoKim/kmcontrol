@@ -121,12 +121,39 @@ $env:KMC_HUB_URL="http://<hub-tailnet-ip>:8080"; $env:KMC_TS_AUTHKEY="tskey-auth
 ### 노트북(agent) 측
 - **설치**(admin 1회): Windows Tailscale 은 시스템 서비스 + WinTun 드라이버라 설치에 관리자 권한이 필수.
   - WTG: `provision.ps1` (SYSTEM) 이 MSI 무인 설치 + `tailscale up ... --advertise-tags=tag:camp-laptop --hostname=<계정>` + `tailscale set --operator=<계정>` 수행.
-  - 비-WTG: MSI/NSIS 인스톨러(elevated)가 Tailscale MSI 를 chain-install + operator 지정.
+  - 비-WTG(**현행**): MSI/NSIS 인스톨러는 **미채용**. `install.ps1` 이 Tailscale 단계만 별도 자식 스크립트로 떼어 UAC 승격하고, 거기서 Tailscale MSI 를 무인 설치(`/qn` + `TS_NOLAUNCH`/`TS_ONBOARDING_FLOW=hide`/`TS_UNATTENDEDMODE=always`) + `up --unattended` 한다. **여기 남은 MSI 는 Tailscale 자체 패키지**이며 우리 패키징이 아니다 — WinTun 드라이버 + LocalSystem 서비스라 어떤 배포 형태를 골라도 관리자 권한을 피할 수 없다. `operator` 지정은 Linux 전용이라 Windows 에선 제거했다.
 - **런타임**(비관리자): agent `tailscale::wait_ready()` 가 startup 에 연결(Running)을 최대 20s 대기만 한다. **`up` 은 호출하지 않는다** — 비관리자 `up` 은 UAC/로그인 GUI 를 띄우고 실패하므로, 예전 `ensure_up()` 은 학생 계정에서 기동마다 권한 창을 띄웠다. 인스톨러의 `up --unattended` 가 재부팅 후 재연결까지 책임진다. 미설치/미연결이면 경고 후 진행 — 제어플레인은 LAN 으로 지속.
   - 대기하는 이유: Hello 의 `stream_addr` 는 1회 전송이라, 그때 100.x 가 없으면 hub 가 공인 NAT IP 로 폴백해 P2P 스트리밍이 깨진다.
 - override 환경변수: `KMC_TAILSCALE`(tailscale.exe 경로). `KMC_TS_AUTHKEY` 는 **인스톨러 전용**이며 노트북에 저장하지 않는다(설치 후 제거).
 
 > 설치·로그인(`up`) 에만 admin 이 필요하고(1회), 이후 학생 계정 런타임은 무권한 *조회*(`status`/`ip`)만 한다 (cua-driver 데몬과 동일한 "설치는 elevated, 운영은 agent" 분리).
+
+### Tailscale 을 agent 에 임베드하지 않는 이유
+사양 제약 3번(`spec.md:28`)이 **네이티브 Tailscale 필수**로 못박은 근거는 스트리밍이다.
+`tsnet`/`--tun=userspace-networking` 으로 임베드하면 tailnet IP 가 **그 프로세스의 유저스페이스
+netstack 안에만** 존재한다. 그런데 agent 는 streamhost 를 in-process 로 띄워 GameStream 6포트를
+**OS 소켓**으로 bind 한다(TCP 47984/47989/48010, UDP 47998/47999/48000). OS 소켓은 유저스페이스
+netstack 에만 도착한 패킷을 받을 수 없다. 쓰려면 RTP 비디오/오디오·ENet 제어를 전부 netstack API
+로 재배선해야 하고, tsnet 은 Go 라 Rust 에서는 cgo/libtailscale FFI 가 된다 — UAC 창 하나를 없애려
+GameStream 호스트·클라이언트를 통째로 다시 쓰는 셈이다. hub 만 tsnet 후보였고(제약 2번), 그것도
+공개 dokploy HTTPS 호스팅으로 대체됐다.
+
+### 설치 시 UAC 를 안 뜨게 하는 방법
+노트북당 UAC **1회**는 네이티브 Tailscale 을 쓰는 한 회피 불가다(WinTun 드라이버 + LocalSystem
+서비스). 없앨 수 있는 경로는 셋뿐이며 전부 `install.ps1` 에 이미 구현돼 있다.
+
+| 방법 | 동작 | 대가 |
+|---|---|---|
+| **학생 계정이 관리자**인 상태에서 관리자 PowerShell 로 한 줄 실행 | `install.ps1:258` `$isAdmin` 분기가 승격 자식을 `-Verb RunAs` 없이 `-NoNewWindow` 로 실행 → **승인 창 0회** | 그 계정에 관리자 권한이 남는다 |
+| **이미지에 Tailscale + `up` 까지 선반영** (WTG `provision.ps1` = specialize 패스 = SYSTEM, UAC 개념 없음) | Tailscale 단계 전체가 no-op | 이미지 빌드 필요 |
+| **authkey 미제공** (`install.ps1:246` `if ($AuthKey)`) | Tailscale 단계를 통째로 건너뜀 | 원격 스트리밍 불가(제어는 hub 로 계속) |
+
+> 함정: **MSI 만** 미리 깔아두는 건 부족하다. `install.ps1:167` 이 MSI 다운로드·설치는 건너뛰지만
+> HKLM 정책키(`:206`)와 `tailscale up` 이 여전히 승격을 요구해 UAC 는 그대로 뜬다.
+>
+> 함정: **다른 관리자 계정으로 UAC 승인하면 안 된다.** 그래서 스크립트 전체를 승격하지 않고
+> Tailscale 단계만 자식으로 떼어냈다(`install.ps1:78-80`) — 전체를 승격하면 `$env:LOCALAPPDATA`
+> 와 HKCU 가 승인한 계정으로 바뀌어 agent 가 엉뚱한 프로필에 설치되고 학생 로그온 때 안 뜬다.
 
 ## 패턴 출처 (MIT)
 - [cschneegans/unattend-generator](https://github.com/cschneegans/unattend-generator) — specialize/OOBE/autologon XML 패턴

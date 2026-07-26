@@ -17,7 +17,7 @@
 | `admin-client` | 관리자용 Tauri 데스크톱 앱 | 관리자 기기(N대) |
 | `web-client` + `streaming-bridge` | (추후 구현, 현재 범위 아님 — 확장 가능하게만 설계) | — |
 
-`agent`는 배포 형태 2종(WTG 내장형 / 일반 설치형)이 있으나 **핵심 로직은 완전히 동일한 하나의 코드베이스**이며, 배포 래퍼(WTG 프로비저닝 스크립트 vs MSI/NSIS 인스톨러)만 다르다.
+`agent`는 배포 형태 2종(WTG 내장형 / 일반 설치형)이 있으나 **핵심 로직은 완전히 동일한 하나의 코드베이스**이며, 배포 래퍼(WTG `provision.ps1` vs `deploy/install.ps1` 한 줄 부트스트랩)만 다르다. 원안의 MSI/NSIS 인스톨러는 **미채용** — 아래 "배포 형태별 차이" 참고.
 
 ---
 
@@ -77,7 +77,7 @@
 ### 배포 형태별 차이 (agent 코어 로직 외부)
 
 - **WTG 내장형**: `unattend.xml` + `provision.ps1`(specialize 패스)로 이미지에 내장. 아래 "WTG 이미지 빌드" 섹션 참고.
-- **일반 설치형**: MSI 또는 NSIS 인스톨러로 패키징, 내장 디스크에 정식 설치.
+- **일반 설치형**: 원안은 MSI 또는 NSIS 패키징이었으나 **채택하지 않았다**. 현행은 `deploy/install.ps1` 한 줄 부트스트랩(`irm <hub>/enroll/<시크릿> | iex`) + `kmc-agent-bundle.zip`(exe + ffmpeg DLL 8개) 전개 방식이다. 이유: (1) 설치 대상이 학생 노트북 수십 대라 갱신 주기가 짧은데 MSI 는 재서명·재배포 비용이 크다, (2) hub 가 `enroll` 응답으로 hub URL·authkey·릴리스 URL 을 주입하므로 인스톨러에 빌드타임 상수를 굽지 않아도 된다, (3) agent 본체는 `%LOCALAPPDATA%` 설치 + HKCU Run 등록이라 관리자 권한이 필요 없다. **단 Tailscale 은 예외** — WinTun 드라이버 + LocalSystem 서비스라 자체 MSI 를 UAC 승격으로 무인 설치한다(우리 패키징이 아니라 Tailscale 배포본이며, 배포 형태와 무관하게 회피 불가). 자세한 건 `deploy/README.md`.
 
 ---
 
@@ -174,7 +174,7 @@
 | **cua-driver 데몬 통합** | agent `cua.rs`가 데몬 수명주기 보장: startup `ensure_daemon()`(status→없으면 `serve` detached 기동) + `enable_autostart()`(로그온 스케줄 작업); `run_gui`는 "daemon not running" 감지 시 되살려 1회 재시도(자가교정); `browser::ensure()`도 window 조회 전 데몬 보장 | E2E (데몬 kill→startup 복구/mid-session 자동복구+재시도/autostart registered 모두 확인) |
 | **브라우저 자동화(단일)** | provision이 학생 Chrome 바로가기를 `--remote-debugging-port=9222 --user-data-dir=C:\kmc\chrome-profile`로 통일 → "사용자 Chrome == AI가 CDP로 조작하는 Chrome". agent `browser.rs`+`kmc_ensure_browser`가 같은 포트/프로필 공유, MCP `web_open`/`web_read`/`web_click`(텍스트 매칭)/`web_type`이 ensure→bind→op를 내부 처리(스크린샷·좌표 없이 DOM, 토큰 최소) | E2E (example.com·iana·bing: open/read/click/type); provision 통일은 문법·바로가기 로직 검증 |
 | WTG 배포 | `deploy/unattend.xml`, `deploy/provision.ps1`, `deploy/README.md` | 작성 완료 (실이미지 빌드 수동); **현재 보류 — 일반 설치형 우선** |
-| **Tailscale (네이티브)** | agent `tailscale.rs::ensure_up()` 자가연결(태그·hostname·unattended, graceful skip) + `provision.ps1` TS설치/operator/hostname + ACL `deploy/tailscale-acl.hujson` | **실 tailnet E2E**: ensure_up 태그연결(`tag:camp-laptop`,100.x)→hub `peer_ip=100.x`→`session_request.tailscale_addr=100.x` |
+| **Tailscale (네이티브)** | **설치·`up` 은 전부 elevated 인스톨러 책임** — `install.ps1` 의 승격 자식이 MSI 무인설치(`TS_NOLAUNCH`/`ONBOARDING_FLOW=hide`/`UNATTENDEDMODE=always`) + `up --unattended` 까지 끝낸다. agent 런타임은 `tailscale.rs::wait_ready()` 로 `BackendState=Running` 을 최대 20s 대기만 하고 **`up` 을 호출하지 않는다**(커밋 `3b389e0`: 비관리자 `up` 은 기동마다 UAC/로그인 GUI 를 띄웠다). 자기 100.x 는 `self_ip()` 가 읽어 Hello `stream_addr` 로 보고(커밋 `a49177b`). ACL `deploy/tailscale-acl.hujson` | **실 tailnet E2E (2026-07-26 라이브 재확인)**: 한 줄 설치가 방화벽 선등록→MSI→정책키→`up`→`tailnet 연결됨: 100.127.176.115` 순서로 완주(30초), hub 가 agent 를 online 으로 승격하고 `session_request` 가 그 100.x 를 반환 |
 | **일반 설치형 (irm\|iex)** | `deploy/install.ps1`(원격 한 줄 설치) + `deploy/build-release-bundle.ps1`(exe+ffmpeg DLL 번들). **방화벽 인바운드 규칙을 승격 자식이 선등록** — agent 가 streamhost 를 in-process 로 띄워 GameStream 6포트를 와일드카드 bind 하므로, 규칙이 없으면 첫 기동에 "네트워크 액세스 허용" 대화상자가 뜬다(학생 계정은 승인 불가 → 한 줄 설치가 깨짐). `kmc-agent-TCP/UDP` 를 program-scoped·port=Any·**`-Profile Any`** 로 박고, 과거 취소로 생긴 **Block 규칙을 먼저 제거**한다(Block 이 Allow 를 이김) | 스크립트 파싱 OK(부모+승격 자식 AST); **번들 자기완결 검증**(ffmpeg PATH 없이 agent 기동 = exit53 해소); **방화벽**: 대화상자가 만든 실규칙이 `TCP/UDP × port=Any × profile=Public 단독`임을 실측(= Private 망에서 스트리밍 사망) → `-Profile Any` 로 교정, Block 정리 쿼리는 대소문자 다른 경로로도 매칭 확인. 실 릴리스 다운로드·TS MSI 설치는 공개호스트·관리자 환경 필요 |
 
 ### 아키텍처 결정 (사양 대비 변경/구체화)

@@ -10,11 +10,13 @@ hub 는 순수 Rust + `rusqlite`(bundled, SQLite C 정적) 라 시스템 lib 의
 |---|---|---|
 | enroll / provision / 로그인 / 명령 / 상태 WS | agent·admin → hub | ✅ 완전 동작 |
 | GUI·브라우저 자동화(명령의 일종) | 위와 동일 | ✅ |
-| **스트리밍 P2P**(영상/오디오/입력) | admin ↔ agent **직접** | ⚠️ tailnet 주소 필요(아래) |
+| **스트리밍 P2P**(영상/오디오/입력) | admin ↔ agent **직접** | ✅ 동작(아래) |
 
-스트리밍 바이트는 hub 를 거치지 않는 **P2P** 다. 다만 admin 이 붙을 **주소**를 hub 가 알려주는데(`session_request`→`tailscale_addr`),
-현재 그 주소를 "agent WS 연결의 출발지 IP"에서 뽑는다. 공개 hub 로 오면 그 값이 agent 의 **공인 NAT IP** 가 되어 P2P 도달이 안 된다.
-→ 스트리밍까지 쓰려면 **2단계**(agent 가 `tailscale ip -4` 로 얻은 자기 100.x 를 status 로 보고 → hub 가 그걸 반환)가 필요. 제어플레인만 쓰면 지금 그대로 OK.
+스트리밍 바이트는 hub 를 거치지 않는 **P2P** 다. admin 이 붙을 **주소**만 hub 가 알려준다(`session_request`→`tailscale_addr`).
+이 주소는 agent 가 Hello 에 실어 보고한 자기 tailnet IP 다 — agent `run.rs:68` `tailscale::self_ip()` → hub `agent_ws.rs:81`
+이 보고값을 우선 채택하고(없을 때만 WS 출발지 IP 폴백) `session_request`(`routes.rs:162`) 가 그대로 반환한다(커밋 `a49177b`).
+따라서 공개 hub 를 거쳐도 공인 NAT IP 로 오염되지 않는다. `GET /agents` 의 `tailscale_addr` 는 **설계상 항상 null** 이며
+(`kmc-proto` `AgentView`), 실제 주소는 세션 요청 때만 나온다.
 
 ## dokploy 배포 순서
 

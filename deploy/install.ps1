@@ -19,6 +19,22 @@
        트레이 아이콘도 숨긴다(-KeepTailscaleTray 로 유지). 로그: <InstallDir>\tailscale-setup.log
     4. agent 용 사용자 환경변수 + 로그온 자동시작(HKCU Run) 등록
     5. agent 즉시 기동
+
+  UAC 를 아예 안 뜨게 하려면 (셋 중 하나):
+    a. **학생이 실제로 쓸 그 계정이 관리자**인 상태에서 "관리자 권한으로 PowerShell 실행" 후
+       같은 한 줄을 돌린다. $isAdmin 분기가 승격 자식을 -Verb RunAs 없이 -NoNewWindow 로
+       돌리므로 승인 창이 0회다. 다른 관리자 계정으로 승격하면 안 된다 - LOCALAPPDATA/HKCU 가
+       그 계정으로 바뀌어 agent 가 엉뚱한 프로필에 깔린다(아래 승격 주석 참고).
+    b. 이미지 단계에서 Tailscale 설치 + `up --unattended` 까지 끝내둔다(WTG provision.ps1 은
+       specialize 패스 = SYSTEM 이라 UAC 개념 자체가 없다). 그러면 이 스크립트의 Tailscale
+       단계가 전부 no-op 이 된다. 단 **MSI 만** 미리 깔아두는 건 부족하다 - 정책키(HKLM)와
+       `up` 이 여전히 승격을 요구하므로 UAC 는 그대로 뜬다.
+    c. authkey 를 주지 않는다(`if ($AuthKey)` 가드). Tailscale 단계 전체를 건너뛰어 UAC 가
+       없지만 원격 스트리밍도 없다(제어는 hub 로 계속).
+  네이티브 Tailscale 을 쓰는 한 노트북당 UAC 1회는 회피 불가다 - WinTun 드라이버 + LocalSystem
+  서비스라서다. agent 안에 Tailscale 을 임베드(tsnet/userspace-networking)하면 tailnet IP 가
+  그 프로세스의 유저스페이스 netstack 안에만 존재해, OS 소켓으로 bind 하는 GameStream 6포트가
+  패킷을 못 받는다(사양 제약 3번의 근거).
 #>
 [CmdletBinding()]
 param(
