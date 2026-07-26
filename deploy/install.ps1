@@ -82,7 +82,7 @@ if (-not (Test-Path $cua)) {
 # 자식 스크립트는 모든 단계의 성패를 명시적으로 판정한다. 예전엔 다운로드/msiexec/up 어느
 # 하나가 실패해도 조용히 통과해 "설치는 됐다는데 tailnet 에 안 붙은" 노트북이 나왔다.
 $tsSetup = @'
-param([Parameter(Mandatory)][string]$AuthKey, [string]$LogPath, [switch]$KeepTray)
+param([Parameter(Mandatory)][string]$AuthKey, [string]$LogPath, [string]$AgentExe, [switch]$KeepTray)
 $ErrorActionPreference = 'Continue'
 function Log($m) {
   $line = "$([DateTime]::UtcNow.ToString('s'))Z  $m"
@@ -116,6 +116,52 @@ function Wait-TsBackend([int]$Seconds) {
     Start-Sleep 1
   }
   return $false
+}
+
+# ---- 방화벽 인바운드 규칙 (승격 필요) ----
+# kmc-agent 는 streamhost 를 in-process 로 띄우며 GameStream 포트 6개를 와일드카드로
+# bind 한다(TCP 47984/47989/48010, UDP 47998/47999/48000). 규칙이 없으면 첫 기동 때
+# Windows 가 "공용/개인 네트워크에서 이 앱에 액세스 허용" 대화상자를 띄운다. 학생 계정은
+# 허용을 누를 수 없고(버튼이 승격을 요구), 무시/취소하면 Block 규칙이 박혀 스트리밍이
+# 통째로 죽는다 - 그래서 한 줄 설치가 깨져 보였다.
+#
+# 대화상자를 이기는 게 아니라 앞지르는 것이다: 규칙이 먼저 있으면 프롬프트 자체가 없다.
+# 게다가 대화상자보다 낫다 - 대화상자는 기본적으로 '개인' 프로필만 체크하므로 학교/카페
+# 같은 '공용' 네트워크에서는 허용을 눌러도 인바운드가 막힌다. -Profile Any 로 박는다.
+#
+# -LocalPort 는 생략(=Any). 대화상자가 만들었을 규칙과 같은 형태이고, 포트 상수가 바뀌어도
+# 규칙이 조용히 어긋나 프롬프트가 되살아나는 일이 없다.
+if ($AgentExe -and (Test-Path $AgentExe)) {
+  # 과거에 대화상자를 취소/무시했다면 Windows 가 이 프로그램 앞으로 Block 규칙을 박아둔다.
+  # Windows 방화벽은 Block 이 Allow 를 이기므로, 걷어내지 않으면 아래 Allow 를 추가해도
+  # 스트리밍이 계속 죽는다 - 정확히 이 증상을 겪은 노트북에서 고쳐지지 않는다는 뜻이다.
+  # 이름이 아니라 "이 exe 를 가리키는 Block 인바운드 규칙" 전부를 대상으로 지운다.
+  try {
+    $ids = @(Get-NetFirewallApplicationFilter -ErrorAction Stop |
+             Where-Object { $_.Program -and $_.Program -ieq $AgentExe } |
+             ForEach-Object { $_.InstanceID })
+    if ($ids.Count) {
+      $stale = @(Get-NetFirewallRule -ErrorAction Stop |
+                 Where-Object { $ids -contains $_.InstanceID -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' })
+      foreach ($s in $stale) {
+        Remove-NetFirewallRule -Name $s.Name -ErrorAction SilentlyContinue
+        Log "방화벽 차단 규칙 제거: $($s.DisplayName)"
+      }
+    }
+  } catch { Log "방화벽 차단 규칙 정리 실패(무시): $_" }
+
+  foreach ($proto in 'TCP', 'UDP') {
+    $rule = "kmc-agent-$proto"
+    try {
+      # 같은 이름의 과거 규칙(경로가 바뀐 재설치분)을 먼저 걷어내 멱등하게 만든다.
+      Remove-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue
+      New-NetFirewallRule -DisplayName $rule -Direction Inbound -Action Allow `
+        -Program $AgentExe -Protocol $proto -Profile Any -ErrorAction Stop | Out-Null
+      Log "방화벽 인바운드 허용: $rule -> $AgentExe"
+    } catch { Log "방화벽 규칙 등록 실패($proto, 무시): $_" }
+  }
+} else {
+  Log "방화벽 규칙 건너뜀 (AgentExe 없음: '$AgentExe')"
 }
 
 if (-not (Test-Path $tsExe)) {
@@ -205,7 +251,7 @@ if ($AuthKey) {
   # ANSI(CP949)로 오독해 한글 문자열에서 구문 오류를 내므로 BOM 이 필요하다.
   # (이 install.ps1 자체는 `irm | iex` 로 실행돼 HTTP charset 으로 디코드되므로 BOM 금지.)
   Set-Content -LiteralPath $tsFile -Value $tsSetup -Encoding UTF8
-  $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tsFile`"", '-AuthKey', "`"$AuthKey`"", '-LogPath', "`"$tsLog`"")
+  $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tsFile`"", '-AuthKey', "`"$AuthKey`"", '-LogPath', "`"$tsLog`"", '-AgentExe', "`"$agentExe`"")
   if ($KeepTailscaleTray) { $psArgs += '-KeepTray' }
   $exit = $null
   try {
