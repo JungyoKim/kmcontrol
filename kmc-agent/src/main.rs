@@ -80,13 +80,32 @@ async fn main() -> Result<()> {
     // 자체 GameStream 호스트를 in-process로 기동(Sunshine 대체). admin이 세션 승인 후
     // 이 노트북 주소로 직접 P2P 연결해 화면/오디오/입력을 주고받는다. hub는 영상을 프록시하지 않는다.
     // 실패해도(예: GPU/캡처 불가) agent 제어플레인은 계속 동작하도록 격리.
-    match kmc_streamhost::host::start(kmc_streamhost::host::HostConfig::default()).await {
-        Ok(rtsp) => {
-            // rtsp 핸들을 leak해 프로세스 수명 내내 호스트를 유지(지속 파이프라인).
-            std::mem::forget(rtsp);
-            tracing::info!("GameStream host started (in-process)");
+    //
+    // tailnet 주소가 없으면 아예 띄우지 않는다. admin은 100.x로 **인바운드** 접속하는데, 그
+    // 주소는 Hello의 `stream_addr`(= `self_ip()`, run.rs:68)로만 전달된다. 없으면 hub가
+    // peer_ip로 폴백하고 그건 프록시 내부 IP라 쓸모없다(agent_ws.rs:96) — 즉 tailnet 없이는
+    // 화면 스트림이 구조적으로 불가능하다.
+    //
+    // 그런데도 bind하면 대가만 남는다: GameStream 6포트가 방화벽 대화상자를 부르는데 학생은
+    // 표준 사용자라 허용을 누를 수 없고, 무시/취소하면 Block 규칙이 박힌다. Block은 Allow를
+    // 이기므로 나중에 Tailscale을 제대로 설치해도 스트리밍이 계속 죽는다 — 쓸 수도 없는
+    // 소켓이 미래의 정상 설치를 오염시키는 셈이다(install.ps1 헤더 주석 c).
+    match tailscale::self_ip() {
+        Some(ip) => {
+            match kmc_streamhost::host::start(kmc_streamhost::host::HostConfig::default()).await {
+                Ok(rtsp) => {
+                    // rtsp 핸들을 leak해 프로세스 수명 내내 호스트를 유지(지속 파이프라인).
+                    std::mem::forget(rtsp);
+                    tracing::info!(tailnet = %ip, "GameStream host started (in-process)");
+                }
+                Err(e) => {
+                    tracing::error!(error=%e, "GameStream host failed to start (control plane continues)")
+                }
+            }
         }
-        Err(e) => tracing::error!(error=%e, "GameStream host failed to start (control plane continues)"),
+        None => tracing::warn!(
+            "tailnet 주소 없음 — GameStream 호스트 미기동(포트 bind 없음 = 방화벽 대화상자/Block 규칙 없음). 제어 플레인은 계속 동작한다"
+        ),
     }
 
     run::run(state).await

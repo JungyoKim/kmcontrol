@@ -1,7 +1,7 @@
 <#
   kmc-agent 일반 설치형 원격 설치 스크립트 (irm | iex).
 
-  사용법 — 일반 PowerShell 로 실행해도 된다. Tailscale 단계에서만 UAC 승인 창이 한 번 뜨고,
+  사용법 — 일반 PowerShell 로 실행해도 된다. 승격 단계에서만 UAC 승인 창이 한 번 뜨고,
   거부하면 그 단계만 건너뛴다(제어는 hub 로 계속 동작, 원격 스트리밍만 불가):
 
     $env:KMC_HUB_URL    = "http://<hub-tailnet-ip>:8080"
@@ -12,11 +12,14 @@
     & ([scriptblock]::Create((irm https://<public-host>/install.ps1))) -HubUrl "..." -AuthKey "..."
 
   하는 일:
-    1. kmc-agent + ffmpeg 런타임 DLL 번들 다운로드·설치 (%LOCALAPPDATA%\kmc, 무권한)
+    1. (authkey 제공) **승격 자식 1회** — Defender 제외 + 방화벽 인바운드 규칙 + Tailscale
+       MSI 설치 + `up --unattended`. 트레이 아이콘도 숨긴다(-KeepTailscaleTray 로 유지).
+       로그: <InstallDir>\tailscale-setup.log
+       다운로드보다 **먼저** 돌아야 한다 - Defender 제외가 늦으면 방금 받은 서명 없는 exe 가
+       그 사이 격리된다. 권한이 필요한 작업은 전부 이 자식 하나에 모아 UAC 를 1회로 묶는다.
+    2. kmc-agent + ffmpeg 런타임 DLL 번들 다운로드·설치 (%LOCALAPPDATA%\kmc, 무권한)
        — ffmpeg DLL 을 exe 옆에 두어 PATH 조작 없이 로드되게 함.
-    2. cua-driver(GUI/브라우저 자동화 백엔드) 없으면 설치 시도 (무권한, best-effort)
-    3. (authkey 제공) Tailscale 없으면 MSI 설치 + `up --unattended` 등록 — 이 단계만 UAC 승격.
-       트레이 아이콘도 숨긴다(-KeepTailscaleTray 로 유지). 로그: <InstallDir>\tailscale-setup.log
+    3. cua-driver(GUI/브라우저 자동화 백엔드) 없으면 설치 시도 (무권한, best-effort)
     4. agent 용 사용자 환경변수 + 로그온 자동시작(HKCU Run) 등록
     5. agent 즉시 기동
 
@@ -29,8 +32,10 @@
        specialize 패스 = SYSTEM 이라 UAC 개념 자체가 없다). 그러면 이 스크립트의 Tailscale
        단계가 전부 no-op 이 된다. 단 **MSI 만** 미리 깔아두는 건 부족하다 - 정책키(HKLM)와
        `up` 이 여전히 승격을 요구하므로 UAC 는 그대로 뜬다.
-    c. authkey 를 주지 않는다(`if ($AuthKey)` 가드). Tailscale 단계 전체를 건너뛰어 UAC 가
-       없지만 원격 스트리밍도 없다(제어는 hub 로 계속).
+    c. authkey 를 주지 않는다(`if ($AuthKey)` 가드). 승격 자식 전체를 건너뛰어 UAC 가 0 회다.
+       대신 Defender 제외·방화벽 규칙·Tailscale 이 모두 빠지고 원격 스트리밍도 없다(제어는
+       hub 로 계속). 방화벽 규칙이 없어도 대화상자는 뜨지 않는다 - tailnet IP 가 없으면
+       agent 가 streamhost 를 아예 기동하지 않아 포트를 bind 하지 않기 때문이다(main.rs).
   네이티브 Tailscale 을 쓰는 한 노트북당 UAC 1회는 회피 불가다 - WinTun 드라이버 + LocalSystem
   서비스라서다. agent 안에 Tailscale 을 임베드(tsnet/userspace-networking)하면 tailnet IP 가
   그 프로세스의 유저스페이스 netstack 안에만 존재해, OS 소켓으로 bind 하는 GameStream 6포트가
@@ -55,37 +60,16 @@ if (-not $HubUrl)  { $HubUrl  = Read-Host 'hub URL (예: http://100.x.x.x:8080)'
 if (-not $HubUrl)  { throw 'hub URL 이 필요합니다.' }
 if (-not $AuthKey) { $AuthKey = Read-Host 'Tailscale authkey (없으면 Enter=LAN 으로만 동작)' }
 
-# ---- 1. agent 번들 다운로드·설치 (무권한) ----
+# ---- 1. 권한 필요 작업 (승격 1회): Defender 제외 + 방화벽 규칙 + Tailscale ----
 Info "install dir: $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-# Defender 제외 먼저(다운로드/압축 해제 전) — 서명 안 된 자체 빌드 exe 가 격리되는 것을 막는다.
-# 관리자일 때만 가능. 다운로드 이전에 등록해야 방금 받은 exe 가 곧바로 격리되지 않는다.
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
-if ($isAdmin) {
-  try { Add-MpPreference -ExclusionPath $InstallDir -ErrorAction Stop; Info "Defender 제외 등록: $InstallDir" }
-  catch { Warn "Defender 제외 실패(무시): $_" }
-}
-$zip = Join-Path $env:TEMP 'kmc-agent-bundle.zip'
-Info "downloading bundle: $ReleaseUrl"
-Invoke-WebRequest -Uri $ReleaseUrl -OutFile $zip -UseBasicParsing
-# 실행 중인 agent 종료(파일 잠금 해제) 후 덮어쓰기.
-Get-Process kmc-agent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
-Expand-Archive -Path $zip -DestinationPath $InstallDir -Force
-Remove-Item $zip -ErrorAction SilentlyContinue
+# agent 경로는 다운로드 전에 확정한다. 승격 자식이 Defender 제외와 방화벽 규칙을 이 경로로
+# 미리 박아야 하기 때문이다 - 실제 파일 존재 확인은 압축 해제 후(2단계)에 한다.
 $agentExe = Join-Path $InstallDir 'kmc-agent.exe'
-if (-not (Test-Path $agentExe)) { throw '번들에 kmc-agent.exe 가 없습니다.' }
-Info "agent installed: $agentExe"
+# 학생 계정이 이미 관리자면 승격 자식을 UAC 없이 -NoNewWindow 로 돌린다(아래 분기 참고).
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 
-# ---- 2. cua-driver (무권한, best-effort) ----
-$cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"
-if (-not (Test-Path $cua)) {
-  $cuaUrl = $(if ($env:KMC_CUA_INSTALL_URL) { $env:KMC_CUA_INSTALL_URL } else { 'https://cua.ai/driver/install.ps1' })
-  Info "installing cua-driver (GUI 자동화 백엔드): $cuaUrl"
-  try { irm $cuaUrl | iex } catch { Warn "cua-driver 설치 실패(나중에 수동 설치 가능): $_" }
-}
-
-# ---- 3. Tailscale (authkey 제공 시) ----
+# 승격 자식 스크립트 본문 (Defender 제외 + 방화벽 규칙 + Tailscale).
 # Windows 는 tailscaled 가 LocalSystem 서비스라 --operator 불필요(Linux 전용). 관리자
 # 컨텍스트에서 `tailscale up --auth-key ... --unattended` 로 등록한다. agent 는 `up` 을 절대
 # 부르지 않는다(비관리자 up = UAC/로그인 GUI → 기동마다 권한 창). --unattended 라 재부팅 후에도
@@ -98,7 +82,7 @@ if (-not (Test-Path $cua)) {
 # 자식 스크립트는 모든 단계의 성패를 명시적으로 판정한다. 예전엔 다운로드/msiexec/up 어느
 # 하나가 실패해도 조용히 통과해 "설치는 됐다는데 tailnet 에 안 붙은" 노트북이 나왔다.
 $tsSetup = @'
-param([Parameter(Mandatory)][string]$AuthKey, [string]$LogPath, [string]$AgentExe, [switch]$KeepTray)
+param([Parameter(Mandatory)][string]$AuthKey, [string]$LogPath, [string]$AgentExe, [string]$InstallDir, [switch]$KeepTray)
 $ErrorActionPreference = 'Continue'
 function Log($m) {
   $line = "$([DateTime]::UtcNow.ToString('s'))Z  $m"
@@ -109,6 +93,26 @@ function Log($m) {
   # 타지 않는다. 없으면 쓰기 실패에도 $wrote=$true 가 되어 출력이 통째로 사라진다.
   if ($LogPath) { try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 -ErrorAction Stop; $wrote = $true } catch {} }
   if (-not $wrote) { Write-Host $line }
+}
+
+# ---- Defender 제외 (승격 필요) ----
+# 서명 없는 자체 빌드 exe + 화면 캡처 + 입력 주입 + 원격 제어라 휴리스틱이 오탐하기 쉬운
+# 조합이다. 격리되면 agent 가 조용히 죽고, 원격 제어 자체가 죽었으므로 원격으로 되살릴
+# 수단이 없다(현장 방문). 부모가 이 자식을 다운로드 전에 호출하므로 여기서 등록하면
+# "받자마자 격리" 창까지 닫힌다.
+#
+# 경로 한정 제외다 - InstallDir 밖에 설치되는 프로그램에는 아무 영향이 없다.
+# Add-MpPreference 성공이 곧 반영은 아니다(관리 장비의 변조 방지는 제외 항목을 잠근다).
+# 실제 반영 여부를 되읽어 판정한다 - 조용히 실패하면 격리를 뒤늦게 현장에서 발견하게 된다.
+if ($InstallDir) {
+  try {
+    Add-MpPreference -ExclusionPath $InstallDir -ErrorAction Stop
+    if (@((Get-MpPreference -ErrorAction Stop).ExclusionPath) -contains $InstallDir) {
+      Log "Defender 제외 등록: $InstallDir"
+    } else {
+      Log "Defender 제외 미반영 (변조 방지로 잠겼을 수 있음): $InstallDir"
+    }
+  } catch { Log "Defender 제외 실패(무시): $_" }
 }
 $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
 
@@ -147,7 +151,10 @@ function Wait-TsBackend([int]$Seconds) {
 #
 # -LocalPort 는 생략(=Any). 대화상자가 만들었을 규칙과 같은 형태이고, 포트 상수가 바뀌어도
 # 규칙이 조용히 어긋나 프롬프트가 되살아나는 일이 없다.
-if ($AgentExe -and (Test-Path $AgentExe)) {
+# 이 자식은 다운로드보다 먼저 돌므로 exe 는 아직 없다. 방화벽은 존재하지 않는 경로도 규칙으로
+# 받아준다(경로는 부모가 InstallDir 에서 확정해 넘긴다). Test-Path 가드를 두면 규칙이 통째로
+# 빠져 첫 기동 때 대화상자가 되살아난다.
+if ($AgentExe) {
   # 과거에 대화상자를 취소/무시했다면 Windows 가 이 프로그램 앞으로 Block 규칙을 박아둔다.
   # Windows 방화벽은 Block 이 Allow 를 이기므로, 걷어내지 않으면 아래 Allow 를 추가해도
   # 스트리밍이 계속 죽는다 - 정확히 이 증상을 겪은 노트북에서 고쳐지지 않는다는 뜻이다.
@@ -259,6 +266,7 @@ Log "tailnet 연결됨: $(& $tsExe ip -4 2>$null | Select-Object -First 1)"
 exit 0
 '@
 
+# authkey 가 없으면 승격 자체를 하지 않는다(UAC 0회 경로, 헤더 주석 c).
 if ($AuthKey) {
   $tsLog  = Join-Path $InstallDir 'tailscale-setup.log'
   $tsFile = Join-Path $env:TEMP "kmc-ts-setup-$PID.ps1"
@@ -267,14 +275,14 @@ if ($AuthKey) {
   # ANSI(CP949)로 오독해 한글 문자열에서 구문 오류를 내므로 BOM 이 필요하다.
   # (이 install.ps1 자체는 `irm | iex` 로 실행돼 HTTP charset 으로 디코드되므로 BOM 금지.)
   Set-Content -LiteralPath $tsFile -Value $tsSetup -Encoding UTF8
-  $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tsFile`"", '-AuthKey', "`"$AuthKey`"", '-LogPath', "`"$tsLog`"", '-AgentExe', "`"$agentExe`"")
+  $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tsFile`"", '-AuthKey', "`"$AuthKey`"", '-LogPath', "`"$tsLog`"", '-AgentExe', "`"$agentExe`"", '-InstallDir', "`"$InstallDir`"")
   if ($KeepTailscaleTray) { $psArgs += '-KeepTray' }
   $exit = $null
   try {
     if ($isAdmin) {
       $exit = (Start-Process powershell.exe -ArgumentList $psArgs -Wait -PassThru -NoNewWindow).ExitCode
     } else {
-      Info 'Tailscale 설치에 관리자 권한이 필요합니다 - UAC 승인 창이 뜹니다 (거부해도 나머지 설치는 계속됩니다)'
+      Info 'Defender 제외/방화벽 규칙/Tailscale 설치에 관리자 권한이 필요합니다 - UAC 승인 창이 한 번 뜹니다 (거부해도 나머지 설치는 계속됩니다)'
       # -WindowStyle Hidden: 승격 자식의 콘솔 창을 띄우지 않는다. UAC 동의 창은 남는다
       # (그건 의도된 것 - 사용자가 승인해야 한다). 진행 상황은 부모가 로그를 되읽어 보여준다.
       $exit = (Start-Process powershell.exe -ArgumentList $psArgs -Wait -PassThru -Verb RunAs -WindowStyle Hidden).ExitCode
@@ -292,9 +300,30 @@ if ($AuthKey) {
     0       { Info 'Tailscale OK (tailnet 연결됨)' }
     2       { Warn 'Tailscale 설치됐지만 tailnet 미연결 - 원격 스트리밍 불가. authkey/tag 권한을 확인하세요.' }
     3       { Warn 'Tailscale 설치 실패 - 원격 스트리밍 불가. 제어는 hub 로 계속 동작합니다.' }
-    $null   { Warn 'Tailscale 단계 미실행 - 원격 스트리밍 불가. 제어는 hub 로 계속 동작합니다.' }
+    $null   { Warn '승격 단계 미실행 (Defender 제외·방화벽·Tailscale 모두 건너뜀) - 원격 스트리밍 불가. 제어는 hub 로 계속 동작합니다.' }
     default { Warn "Tailscale 설치 스크립트 비정상 종료 (exit=$exit)" }
   }
+}
+
+# ---- 2. agent 번들 다운로드·설치 (무권한) ----
+# 승격 단계 뒤에 받는다 - Defender 제외가 먼저 등록돼야 압축 해제 직후 격리되지 않는다.
+$zip = Join-Path $env:TEMP 'kmc-agent-bundle.zip'
+Info "downloading bundle: $ReleaseUrl"
+Invoke-WebRequest -Uri $ReleaseUrl -OutFile $zip -UseBasicParsing
+# 실행 중인 agent 종료(파일 잠금 해제) 후 덮어쓰기.
+Get-Process kmc-agent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 500
+Expand-Archive -Path $zip -DestinationPath $InstallDir -Force
+Remove-Item $zip -ErrorAction SilentlyContinue
+if (-not (Test-Path $agentExe)) { throw '번들에 kmc-agent.exe 가 없습니다.' }
+Info "agent installed: $agentExe"
+
+# ---- 3. cua-driver (무권한, best-effort) ----
+$cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"
+if (-not (Test-Path $cua)) {
+  $cuaUrl = $(if ($env:KMC_CUA_INSTALL_URL) { $env:KMC_CUA_INSTALL_URL } else { 'https://cua.ai/driver/install.ps1' })
+  Info "installing cua-driver (GUI 자동화 백엔드): $cuaUrl"
+  try { irm $cuaUrl | iex } catch { Warn "cua-driver 설치 실패(나중에 수동 설치 가능): $_" }
 }
 
 # ---- 4. 사용자 환경변수 + 자동시작 (무권한) ----
