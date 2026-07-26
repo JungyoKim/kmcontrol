@@ -101,8 +101,8 @@ if (-not (Get-LocalUser -Name $accountName -ErrorAction SilentlyContinue)) {
     } catch { Log "New-LocalUser failed: $_" }
 }
 
-# ---- 4b. Tailscale operator + hostname (학생 계정이 런타임에 tailscale up/status 가능하도록) ----
-# 설치·operator 지정은 여기(SYSTEM=admin)서 1회. 이후 agent(비관리자)가 ensure_up 으로 재연결 가능.
+# ---- 4b. Tailscale operator + hostname (학생 계정이 런타임에 tailscale status/ip 조회 가능하도록) ----
+# 설치·operator 지정·up 은 여기(SYSTEM=admin)서 1회. agent(비관리자)는 조회만 하고 up 은 안 한다.
 if (Test-Path $tsExe) {
     & $tsExe set --operator="$env:COMPUTERNAME\$accountName" 2>&1 | ForEach-Object { Log "ts-operator: $_" }
     if ($AuthKey) {

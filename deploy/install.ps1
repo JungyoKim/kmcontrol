@@ -68,8 +68,9 @@ if (-not (Test-Path $cua)) {
 
 # ---- 3. Tailscale (authkey 제공 + 관리자) ----
 # Windows 는 tailscaled 가 시스템 서비스라 --operator 불필요(Linux 전용). 관리자 컨텍스트에서
-# 직접 `tailscale up --auth-key ... --unattended` 로 등록한다(agent ensure_up 에 안 맡김 —
-# 비관리자 agent 가 up 하면 로그인 GUI 가 떠서 실패).
+# 직접 `tailscale up --auth-key ... --unattended` 로 등록한다. agent 는 `up` 을 절대 부르지
+# 않는다(비관리자 up = UAC/로그인 GUI → 기동마다 권한 창). --unattended 라 재부팅 후에도
+# tailscaled 가 스스로 재연결하므로 런타임 재-up 자체가 불필요하다.
 $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
 if ($AuthKey) {
   if (-not (Test-Path $tsExe)) {
@@ -101,7 +102,9 @@ $stateFile = Join-Path $InstallDir 'agent-state.json'
 [Environment]::SetEnvironmentVariable('KMC_UNIFY_BROWSER', '1', 'User')      # 사용자 Chrome == AI 조작 Chrome 통일
 [Environment]::SetEnvironmentVariable('KMC_CUA_DRIVER', $cua, 'User')
 [Environment]::SetEnvironmentVariable('KMC_AGENT_STATE', $stateFile, 'User')
-if ($AuthKey) { [Environment]::SetEnvironmentVariable('KMC_TS_AUTHKEY', $AuthKey, 'User') }
+# authkey 는 설치 시점에만 쓰고 노트북에 남기지 않는다(agent 는 `up` 을 안 하므로 불필요).
+# 과거 설치가 심어둔 값이 있으면 함께 제거한다.
+[Environment]::SetEnvironmentVariable('KMC_TS_AUTHKEY', $null, 'User')
 
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 Set-ItemProperty -Path $runKey -Name 'kmc-agent' -Value "`"$agentExe`"" -Type String
@@ -112,6 +115,5 @@ $env:KMC_HUB_URL = $HubUrl
 $env:KMC_UNIFY_BROWSER = '1'
 $env:KMC_CUA_DRIVER = $cua
 $env:KMC_AGENT_STATE = $stateFile
-if ($AuthKey) { $env:KMC_TS_AUTHKEY = $AuthKey }
 Start-Process -FilePath $agentExe -WindowStyle Hidden
 Info "kmc-agent 기동 완료. hub=$HubUrl  dir=$InstallDir"

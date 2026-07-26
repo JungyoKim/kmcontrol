@@ -999,6 +999,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmc-gsproto"
+version = "0.1.0"
+
+[[package]]
 name = "kmc-proto"
 version = "0.1.0"
 dependencies = [
@@ -1023,6 +1027,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "kmc-gsproto",
  "parking_lot",
  "rand 0.8.7",
  "rayon",

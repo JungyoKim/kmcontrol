@@ -1,15 +1,21 @@
 //! Tailscale 런타임 연결 보장 — 네이티브 tailscaled를 agent가 tailnet에 붙여둔다.
 //!
-//! 설치(시스템 서비스 + WinTun 드라이버)는 admin이 필요하므로 elevated 인스톨러
-//! (WTG: `provision.ps1`, 비-WTG: MSI/NSIS)의 책임이다. 그 단계에서 학생 계정을
-//! Tailscale operator로 지정해두면(=`tailscale set --operator`), 여기(비관리자 런타임)서
-//! `tailscale up`/status를 권한 없이 호출할 수 있다.
+//! 설치와 **로그인(`up`)은 모두 elevated 인스톨러의 책임**이다(WTG: `provision.ps1`,
+//! 비-WTG: `install.ps1`/MSI). 인스톨러가 `up --unattended`로 등록해두면 tailscaled가
+//! 시스템 서비스로 부팅마다 스스로 재연결하므로, 런타임에 `up`을 다시 부를 이유가 없다.
 //!
-//! agent는 startup에 `ensure_up()`으로 tailnet 연결을 자가보장한다(cua 데몬과 동일 패턴).
-//! hub가 tailnet에서 도달되면, agent가 hub의 tailnet 주소로 WS를 맺어 hub가 캡처하는
-//! peer_ip가 곧 이 노드의 100.x 주소가 되고 → 세션 주소/스트리밍 타겟이 자동 tailnet화된다.
+//! **agent는 절대 `tailscale up`을 호출하지 않는다.** Windows의 tailscaled는 SYSTEM
+//! 서비스여서 비관리자 컨텍스트의 `up`은 UAC/로그인 GUI를 띄우고 실패한다(= 학생 계정에서
+//! agent 기동마다 권한 창이 뜨던 원인). 상태 *조회*는 무권한으로 되므로, agent는
+//! `wait_ready()`로 연결이 설 때까지 유한 대기만 하고 안 되면 경고 후 진행한다
+//! (제어플레인은 LAN/공개 hub로 계속 동작).
+//!
+//! 유한 대기가 필요한 이유: 로그온 직후엔 tailscaled가 아직 handshake 중일 수 있는데,
+//! `self_ip()`가 그때 None이면 Hello의 `stream_addr`가 비어 hub가 공인 NAT IP로 폴백해
+//! P2P 스트리밍이 깨진다. Hello 전에 100.x를 확보하는 게 목적이다.
 
 use std::process::Command;
+use std::time::Duration;
 
 /// tailscale.exe 경로. env override(KMC_TAILSCALE) 우선, 없으면 표준 설치 경로.
 fn tailscale_path() -> String {
@@ -28,38 +34,35 @@ fn is_up(exe: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// tailnet 연결을 보장한다. 이미 Running이면 no-op. 아니면 authkey로 `up`.
-/// 설치가 안 돼 있으면(비관리자 런타임에선 설치 불가) 경고만 남기고 넘어간다 —
-/// 제어플레인(hub WS)은 LAN/localhost로도 계속 동작하므로 치명적이지 않다.
-pub fn ensure_up(hostname: &str) {
+/// tailnet 연결(Running)이 설 때까지 최대 `timeout` 대기한다. 연결되면 `true`.
+///
+/// 미설치면 즉시 `false`(대기하지 않음). `up`은 호출하지 않는다 — 모듈 문서 참고.
+pub fn wait_ready(timeout: Duration) -> bool {
     let exe = tailscale_path();
     if !std::path::Path::new(&exe).exists() {
-        tracing::warn!(%exe, "tailscale not installed — elevated installer/provision must install it; skipping");
-        return;
+        tracing::warn!(%exe, "tailscale not installed — elevated installer must install + `up`; continuing on LAN");
+        return false;
     }
-    if is_up(&exe) {
-        tracing::info!("tailscale already connected");
-        return;
-    }
-    let Ok(authkey) = std::env::var("KMC_TS_AUTHKEY") else {
-        tracing::warn!("tailscale not connected and KMC_TS_AUTHKEY unset — skipping up (assume provisioned elsewhere)");
-        return;
-    };
-    let mut cmd = Command::new(&exe);
-    cmd.arg("up")
-        .arg(format!("--authkey={authkey}"))
-        .arg(format!("--advertise-tags={}", kmc_proto::CAMP_LAPTOP_TAG))
-        .arg("--unattended");
-    if !hostname.is_empty() {
-        cmd.arg(format!("--hostname={hostname}"));
-    }
-    match cmd.output() {
-        Ok(o) if o.status.success() => tracing::info!(%hostname, "tailscale up ok"),
-        Ok(o) => tracing::warn!(
-            stderr = %String::from_utf8_lossy(&o.stderr),
-            "tailscale up failed (operator not set? admin needed once)"
-        ),
-        Err(e) => tracing::warn!(error = %e, "tailscale up spawn failed"),
+    let deadline = std::time::Instant::now() + timeout;
+    let mut waited = false;
+    loop {
+        if is_up(&exe) {
+            if waited {
+                tracing::info!("tailscale connected after wait");
+            } else {
+                tracing::info!("tailscale already connected");
+            }
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                timeout_s = timeout.as_secs(),
+                "tailscale not connected in time (logged out? installer must run `up --unattended` as admin) — continuing on LAN"
+            );
+            return false;
+        }
+        waited = true;
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 

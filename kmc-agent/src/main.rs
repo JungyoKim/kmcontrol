@@ -19,9 +19,10 @@ async fn main() -> Result<()> {
         .init();
 
     let state = provision::provision().await?;
-    // tailnet 연결 보장(네이티브 tailscaled). hub가 tailnet에서 도달되면 이 노드의 100.x가
-    // 세션 주소/스트리밍 타겟으로 자동 사용됨. 설치는 elevated 인스톨러/provision 책임.
-    tailscale::ensure_up(&state.name);
+    // tailnet 연결 대기(최대 20s). 설치와 `up`은 elevated 인스톨러 책임이고 agent는 조회만
+    // 한다 — 비관리자 `up`은 UAC/로그인 GUI를 띄우고 실패하므로 절대 부르지 않는다.
+    // Hello 전에 100.x를 확보해야 hub가 스트리밍 타겟을 tailnet 주소로 잡는다.
+    tailscale::wait_ready(std::time::Duration::from_secs(20));
     // cua-driver 데몬을 보장(GUI/브라우저 자동화의 필수 백엔드) + 로그온 자동 기동 등록.
     cua::ensure_daemon();
     cua::enable_autostart();

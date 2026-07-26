@@ -105,10 +105,11 @@ $env:KMC_HUB_URL="http://<hub-tailnet-ip>:8080"; $env:KMC_TS_AUTHKEY="tskey-auth
 - **설치**(admin 1회): Windows Tailscale 은 시스템 서비스 + WinTun 드라이버라 설치에 관리자 권한이 필수.
   - WTG: `provision.ps1` (SYSTEM) 이 MSI 무인 설치 + `tailscale up ... --advertise-tags=tag:camp-laptop --hostname=<계정>` + `tailscale set --operator=<계정>` 수행.
   - 비-WTG: MSI/NSIS 인스톨러(elevated)가 Tailscale MSI 를 chain-install + operator 지정.
-- **런타임 연결**(비관리자): operator 로 지정된 학생 계정에서 agent `tailscale::ensure_up()` 가 startup 마다 연결을 자가보장(끊겼으면 `KMC_TS_AUTHKEY` 로 재-up). 미설치/키없음이면 graceful skip — 제어플레인은 LAN 으로 지속.
-- override 환경변수: `KMC_TAILSCALE`(tailscale.exe 경로), `KMC_TS_AUTHKEY`(authkey).
+- **런타임**(비관리자): agent `tailscale::wait_ready()` 가 startup 에 연결(Running)을 최대 20s 대기만 한다. **`up` 은 호출하지 않는다** — 비관리자 `up` 은 UAC/로그인 GUI 를 띄우고 실패하므로, 예전 `ensure_up()` 은 학생 계정에서 기동마다 권한 창을 띄웠다. 인스톨러의 `up --unattended` 가 재부팅 후 재연결까지 책임진다. 미설치/미연결이면 경고 후 진행 — 제어플레인은 LAN 으로 지속.
+  - 대기하는 이유: Hello 의 `stream_addr` 는 1회 전송이라, 그때 100.x 가 없으면 hub 가 공인 NAT IP 로 폴백해 P2P 스트리밍이 깨진다.
+- override 환경변수: `KMC_TAILSCALE`(tailscale.exe 경로). `KMC_TS_AUTHKEY` 는 **인스톨러 전용**이며 노트북에 저장하지 않는다(설치 후 제거).
 
-> 설치 단계에만 admin 이 필요하고(1회), 이후 학생 계정 런타임은 operator 권한으로 무권한 연결/조회가 가능하다 (cua-driver 데몬과 동일한 "설치는 elevated, 운영은 agent" 분리).
+> 설치·로그인(`up`) 에만 admin 이 필요하고(1회), 이후 학생 계정 런타임은 무권한 *조회*(`status`/`ip`)만 한다 (cua-driver 데몬과 동일한 "설치는 elevated, 운영은 agent" 분리).
 
 ## 패턴 출처 (MIT)
 - [cschneegans/unattend-generator](https://github.com/cschneegans/unattend-generator) — specialize/OOBE/autologon XML 패턴
