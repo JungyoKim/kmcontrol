@@ -3,13 +3,14 @@ name = "kmc-moonclient"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "GameStream client: pairing + HTTP launch + moonlight-common-c connection driver"
+description = "GameStream client: pairing + HTTP launch + pure-Rust RTSP/control/RTP media session"
 
 [lib]
 name = "kmc_moonclient"
 
 [dependencies]
-kmc-mooncommon = { path = "../kmc-mooncommon" }
+# 와이어 포맷 단일 소스 (호스트 kmc-streamhost 와 공유)
+kmc-gsproto = { path = "../kmc-gsproto" }
 anyhow = "1"
 tracing = "0.1"
 # HTTP + mutual TLS (client cert + pinned server cert)
@@ -31,6 +32,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # H.264는 프론트(WebCodecs)가 GPU 디코드한다 — 클라이언트는 인코딩 AU만 전달(ffmpeg 불필요).
 parking_lot = "0.12"
+# async runtime (media path: tokio::net::UdpSocket)
+tokio = { version = "1", features = ["full"] }
+# Reed-Solomon FEC 복구 (호스트 packetizer 와 동일 크레이트/파라미터)
+fec-rs = "0.1"
+# control 채널 ENet 클라이언트 (순수 Rust)
+tokio-enet = "0.1"
+# RTSP 요청/응답 직렬화 + SDP
+rtsp-types = "0.1"
+sdp-types = "0.1"
+# UDP 수신 버퍼 확대 (IDR 은 수백 shard 버스트 - 기본 버퍼로는 유실된다)
+socket2 = "0.5"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

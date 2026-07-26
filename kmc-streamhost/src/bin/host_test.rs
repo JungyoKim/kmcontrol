@@ -20,7 +20,18 @@ async fn main() -> Result<()> {
         default_hook(info);
     }));
 
-    let config = kmc_streamhost::host::HostConfig::default();
+    // 같은 머신에 Sunshine 등 다른 GameStream 호스트가 떠 있으면 포트를 비켜 띄운다.
+    let mut config = kmc_streamhost::host::HostConfig::default();
+    if let Ok(p) = std::env::var("KMC_HTTP_PORT") {
+        config.http_port = p.parse()?;
+    }
+    if let Ok(p) = std::env::var("KMC_HTTPS_PORT") {
+        config.https_port = p.parse()?;
+    }
+    if let Ok(p) = std::env::var("KMC_RTSP_PORT") {
+        config.rtsp_port = p.parse()?;
+    }
+    tracing::info!(config.http_port, config.https_port, config.rtsp_port, "ports");
     let rtsp = kmc_streamhost::host::start(config).await?;
 
     tracing::info!("host running — pair from Moonlight, then Ctrl+C to inspect negotiated context");

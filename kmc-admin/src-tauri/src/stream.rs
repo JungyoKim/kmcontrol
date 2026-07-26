@@ -8,14 +8,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use kmc_moonclient::{conn, pair, AuFrame, Identity};
+use kmc_moonclient::{pair, AuFrame, Identity, StreamSession};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 
 /// 활성 스트림 상태.
 #[derive(Default)]
 pub struct StreamState {
-    session: Mutex<Option<conn::StreamSession>>,
+    session: Mutex<Option<StreamSession>>,
     /// 비디오 WS 클라이언트로 팬아웃할 브로드캐스트(한 번 만들어 재사용).
     bcast: Mutex<Option<broadcast::Sender<Arc<Vec<u8>>>>>,
     /// 비디오 로컬 WS 서버 포트(한 번 바인딩 후 고정).
@@ -71,6 +71,7 @@ impl StreamState {
             address: address.to_string(),
             http_port: http,
             https_port: https,
+            rtsp_port: pair::DEFAULT_RTSP_PORT,
             server_cert_pem: String::new(),
         };
 
@@ -93,12 +94,12 @@ impl StreamState {
             }
         });
 
-        let session = conn::start_stream(&info, &host, &launch, width, height, fps, 20_000, au_tx, audio_tx, allow_hevc)?;
+        let session = kmc_moonclient::start_stream(&info, &host, &launch, width, height, fps, 20_000, au_tx, audio_tx, allow_hevc)?;
         *self.session.lock() = Some(session);
         Ok(())
     }
 
-    /// 스트림 종료 (StreamSession drop → LiStopConnection). WS 서버는 유지(재연결 재사용).
+    /// 스트림 종료 (StreamSession drop → control 끊기 + 수신 루프 종료). WS 서버는 유지(재연결 재사용).
     pub fn stop(&self) {
         *self.session.lock() = None;
     }
@@ -131,7 +132,7 @@ impl StreamState {
 }
 
 /// WS 팬아웃 서버 1개를 127.0.0.1:임의포트에 바인딩하고 (브로드캐스트 sender, 포트)를 반환.
-/// `idr_on_connect`면 새 클라이언트 연결/랙 시 conn::request_idr()로 키프레임을 요청(비디오용).
+/// `idr_on_connect`면 새 클라이언트 연결/랙 시 request_idr()로 키프레임을 요청(비디오용).
 fn spawn_ws_server(idr_on_connect: bool) -> Result<(broadcast::Sender<Arc<Vec<u8>>>, u16)> {
     let (tx, _rx) = broadcast::channel::<Arc<Vec<u8>>>(512);
     let server_tx = tx.clone();
@@ -191,7 +192,7 @@ async fn serve_client(
 
     // 비디오: 새 클라이언트 → 키프레임부터 시작하도록 IDR 요청.
     if idr_on_connect {
-        conn::request_idr();
+        kmc_moonclient::request_idr();
     }
 
     loop {
@@ -205,7 +206,7 @@ async fn serve_client(
                 // 랙으로 프레임을 놓치면 디코더 동기가 깨지므로 IDR 재요청(비디오만).
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     if idr_on_connect {
-                        conn::request_idr();
+                        kmc_moonclient::request_idr();
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,

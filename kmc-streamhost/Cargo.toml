@@ -72,6 +72,9 @@ tokio-enet = "0.1"
 # Reed-Solomon FEC (Moonlight video parity shards)
 fec-rs = "0.1"
 
+# 와이어 포맷 단일 소스 (클라이언트 kmc-moonclient 와 공유)
+kmc-gsproto = { path = "../kmc-gsproto" }
+
 
 # CPU parallelism for color conversion
 rayon = "1"

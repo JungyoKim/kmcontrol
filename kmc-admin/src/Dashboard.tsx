@@ -779,7 +779,7 @@ function StreamView({
               <canvas
                 ref={canvasRef}
                 tabIndex={0}
-                className="block max-h-[75vh] w-auto min-h-0 min-w-0 max-w-full cursor-crosshair object-contain outline-none"
+                className="block max-h-[75vh] w-auto min-h-0 min-w-0 max-w-full cursor-none object-contain outline-none"
               />
               <div className="pointer-events-none absolute left-2 top-2 rounded px-2 py-1 text-xs font-medium"
                 style={{ background: hovering ? "rgba(22,163,74,0.85)" : "rgba(0,0,0,0.6)", color: "white" }}>

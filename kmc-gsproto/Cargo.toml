@@ -1,0 +1,8 @@
+[package]
+name = "kmc-gsproto"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "GameStream 비디오 와이어 포맷 (kmc-streamhost ⇄ kmc-moonclient 공용)"
+
+[dependencies]

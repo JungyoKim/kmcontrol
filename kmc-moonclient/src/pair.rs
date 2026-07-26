@@ -45,12 +45,23 @@ impl Identity {
     }
 }
 
+/// GameStream 관례 RTSP 포트. 호스트 `HostConfig::rtsp_port` 의 기본값과 같다.
+pub const DEFAULT_RTSP_PORT: u16 = 48010;
+
+fn default_rtsp_port() -> u16 {
+    DEFAULT_RTSP_PORT
+}
+
 /// 페어링된 호스트 (서버 인증서 pin 저장).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PairedHost {
     pub address: String,
     pub http_port: u16,
     pub https_port: u16,
+    /// RTSP 협상 포트. 호스트가 설정으로 바꿀 수 있으므로 상수로 박지 않는다
+    /// (`kmc-streamhost` `HostConfig::rtsp_port`). 옛 레코드에는 없으므로 기본값을 채운다.
+    #[serde(default = "default_rtsp_port")]
+    pub rtsp_port: u16,
     pub server_cert_pem: String,
 }
 
@@ -269,6 +280,7 @@ pub fn pair(
         address: address.to_string(),
         http_port,
         https_port,
+        rtsp_port: DEFAULT_RTSP_PORT,
         server_cert_pem,
     })
 }
@@ -292,14 +304,10 @@ pub fn launch(
     let rikeyid = i32::from_be_bytes([rikey_iv[0], rikey_iv[1], rikey_iv[2], rikey_iv[3]]);
 
     let verb = if resume { "resume" } else { "launch" };
-    let launch_q = unsafe {
-        let q = kmc_mooncommon::LiGetLaunchUrlQueryParameters();
-        if q.is_null() {
-            String::new()
-        } else {
-            std::ffi::CStr::from_ptr(q).to_string_lossy().into_owned()
-        }
-    };
+    // moonlight-common-c `LiGetLaunchUrlQueryParameters()` 는 상수 문자열 하나를 돌려준다
+    // (Connection.c:550). corever=1 = 비디오/control 암호화 v2 + RTSP 암호화 미사용.
+    // 우리 호스트(kmc-streamhost)도 이 값을 기대하므로 그대로 붙인다.
+    let launch_q = "&corever=1";
     let url = format!(
         "https://{}:{}/{verb}?uniqueid={}&uuid={}&appid=1&mode={}x{}x{}&additionalStates=1&sops=0&rikey={}&rikeyid={}&localAudioPlayMode=0&surroundAudioInfo=196610&remoteControllersBitmap=0&gcmap=0&gcpersist=0{}",
         host.address,

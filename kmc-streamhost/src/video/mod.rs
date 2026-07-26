@@ -138,25 +138,25 @@ pub async fn start(bind_ip: &str, port: u16, packet_size: usize, session_reset: 
                         frame.rtp_timestamp,
                         fec_pct,
                     );
-                    // 페이싱(bufferbloat 방지): shard 를 목표 비트레이트 속도에 맞춰 균일하게 흘려보낸다.
-                    // 한 번에 쏟아부으면(버스트) 셀룰러가 못 받아 뭉텅이 손실 → 손실률 폭등 → 알고리즘이
-                    // 회선을 과소평가한다. 목표 bps 로 나눈 배치 간 지연으로 회선 속도에 맞춰 보낸다.
-                    let target_bps = bitrate.poll_target().max(500_000) as u64;
-                    const SEND_BATCH: usize = 16; // ~16 × 1KB ≈ 16KB per batch (작게 = 매끄러운 페이싱)
-                    let batch_bytes = (SEND_BATCH * packet_size) as u64;
-                    // 이 배치를 목표 속도로 보내는 데 걸릴 시간(us) = bytes*8 / bps * 1e6.
-                    let batch_delay = std::time::Duration::from_micros(batch_bytes * 8 * 1_000_000 / target_bps);
+                    // 가벼운 버스트 평활화: 작은 프레임(대부분)은 그대로 즉시 전송(지연 0).
+                    // 큰 프레임(IDR 등 shard 많음)만 배치 사이에 아주 짧게(200us) 양보해 커널/회선이
+                    // 순간 폭주로 뭉텅이 손실 나는 것만 막는다. 페이싱을 길게 하면 프레임이 늦게 도착해
+                    // 잔상/지연이 생기므로(측정 확인) sleep 은 최소로만 둔다.
+                    const SEND_BATCH: usize = 32;
+                    let big_frame = shards.len() > SEND_BATCH;
                     for (i, shard) in shards.iter().enumerate() {
                         if let Err(e) = socket.send_to(shard, dst).await {
                             tracing::warn!(error=%e, "video send failed");
                             break;
                         }
-                        if (i + 1) % SEND_BATCH == 0 {
-                            tokio::time::sleep(batch_delay).await;
+                        // 큰 프레임에서만, 배치 경계마다 200us 양보(총 지연 ≤ 프레임당 ~1-2ms).
+                        if big_frame && (i + 1) % SEND_BATCH == 0 {
+                            tokio::time::sleep(std::time::Duration::from_micros(200)).await;
                         }
                     }
+                    let target_kbps = bitrate.poll_target() / 1000;
                     if frame_number % 60 == 1 {
-                        tracing::info!(frame_number, shards = shards.len(), fec_pct, dropped, target_kbps = target_bps / 1000, "video frames flowing");
+                        tracing::info!(frame_number, shards = shards.len(), fec_pct, dropped, target_kbps, "video frames flowing");
                     } else {
                         tracing::trace!(frame_number, shards = shards.len(), fec_pct, dropped, "video frame sent");
                     }
