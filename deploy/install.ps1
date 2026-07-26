@@ -86,8 +86,13 @@ param([Parameter(Mandatory)][string]$AuthKey, [string]$LogPath, [switch]$KeepTra
 $ErrorActionPreference = 'Continue'
 function Log($m) {
   $line = "$([DateTime]::UtcNow.ToString('s'))Z  $m"
-  Write-Host $line
-  if ($LogPath) { try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {} }
+  # 부모가 로그 파일을 되읽어 출력한다. 파일에 썼으면 콘솔 출력은 생략 - 승격 자식은
+  # 창이 숨겨져 있어 어차피 안 보이고, 관리자 직행 경로에선 중복 출력이 된다.
+  $wrote = $false
+  # -ErrorAction Stop 필수: 이 스크립트는 EAP=Continue 라 non-terminating 오류는 catch 를
+  # 타지 않는다. 없으면 쓰기 실패에도 $wrote=$true 가 되어 출력이 통째로 사라진다.
+  if ($LogPath) { try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 -ErrorAction Stop; $wrote = $true } catch {} }
+  if (-not $wrote) { Write-Host $line }
 }
 $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
 
@@ -133,15 +138,35 @@ if (-not (Test-Path $tsExe)) {
     }
   }
   if ($got) {
-    Log 'installing Tailscale (msiexec /qn)'
+    Log 'installing Tailscale (msiexec /qn, GUI 억제)'
     # 0=성공, 3010=설치됨(재부팅 권고). 그 외는 실패 - 예전엔 종료코드를 안 봐서 1603/1618
     # 같은 실패에도 그대로 진행했다.
-    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+    #
+    # TS_NOLAUNCH: 설치 끝에 트레이 GUI 를 띄우지 않는다. 실물 MSI(36MB, stable)의 실행
+    # 시퀀스 조건이 `... AND (NOT TS_NOLAUNCH)` 라 신규 설치와 업그레이드 양쪽에 걸린다.
+    # 이게 없으면 msiexec /qn 이어도 tailscale-ipn.exe 가 뜨고, 아직 up 전이라 로그인
+    # 창까지 같이 떴다(우리 kill 은 up 이후라 그 사이 수십 초가 그대로 노출됐다).
+    # TS_ONBOARDING_FLOW/TS_UNATTENDEDMODE 는 HKLM\SOFTWARE\Policies\Tailscale 정책으로
+    # 박혀서, 학생이 GUI 를 직접 실행해도 온보딩이 안 뜨고 unattended 를 못 끈다.
+    $props = 'TS_NOLAUNCH=1 TS_ONBOARDING_FLOW=hide TS_UNATTENDEDMODE=always'
+    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart $props" -Wait -PassThru
     if ($p.ExitCode -notin 0, 3010) { Log "msiexec 실패 (exit=$($p.ExitCode))" }
     Remove-Item $msi -ErrorAction SilentlyContinue
   }
 }
 if (-not (Test-Path $tsExe)) { Log 'Tailscale 설치 실패'; exit 3 }
+
+# 위 정책은 MSI 프로퍼티라 "이미 설치돼 있어 MSI 를 건너뛴" 경로에는 적용되지 않는다.
+# 승격된 상태이므로 같은 값을 직접 박아 설치 경로와 무관하게 동일 상태로 만든다.
+# EAP=Continue 에서는 -ErrorAction Stop 이 없으면 권한 거부가 non-terminating 오류로 흘러
+# catch 를 타지 않는다. 실측: 비관리자로 돌리면 키가 안 생기는데 로그는 조용했다.
+try {
+  $pol = 'HKLM:\SOFTWARE\Policies\Tailscale'
+  if (-not (Test-Path $pol)) { New-Item -Path $pol -Force -ErrorAction Stop | Out-Null }
+  Set-ItemProperty -Path $pol -Name 'UnattendedMode' -Value 'always' -Type String -ErrorAction Stop
+  Set-ItemProperty -Path $pol -Name 'OnboardingFlow' -Value 'hide'   -Type String -ErrorAction Stop
+  Log 'tailscale 정책 설정: UnattendedMode=always, OnboardingFlow=hide'
+} catch { Log "정책 레지스트리 설정 실패(무시): $_" }
 
 if (-not (Wait-TsBackend 30)) { Log 'tailscaled 가 30초 내 무응답 - up 을 그래도 시도한다' }
 Log 'tailscale up (authkey, tag:camp-laptop, unattended)'
@@ -188,7 +213,9 @@ if ($AuthKey) {
       $exit = (Start-Process powershell.exe -ArgumentList $psArgs -Wait -PassThru -NoNewWindow).ExitCode
     } else {
       Info 'Tailscale 설치에 관리자 권한이 필요합니다 - UAC 승인 창이 뜹니다 (거부해도 나머지 설치는 계속됩니다)'
-      $exit = (Start-Process powershell.exe -ArgumentList $psArgs -Wait -PassThru -Verb RunAs).ExitCode
+      # -WindowStyle Hidden: 승격 자식의 콘솔 창을 띄우지 않는다. UAC 동의 창은 남는다
+      # (그건 의도된 것 - 사용자가 승인해야 한다). 진행 상황은 부모가 로그를 되읽어 보여준다.
+      $exit = (Start-Process powershell.exe -ArgumentList $psArgs -Wait -PassThru -Verb RunAs -WindowStyle Hidden).ExitCode
     }
   } catch {
     # UAC 취소/거부는 여기로 온다(1223). 치명적이지 않다 - 제어 플레인은 hub 로 계속 동작한다.

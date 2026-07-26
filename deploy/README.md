@@ -90,6 +90,14 @@ $env:KMC_HUB_URL="http://<hub-tailnet-ip>:8080"; $env:KMC_TS_AUTHKEY="tskey-auth
   `%LOCALAPPDATA%`/`HKCU` 가 그 계정으로 바뀌어 agent 가 엉뚱한 프로필에 설치된다.
   결과 판정은 "exe 존재"가 아니라 **`BackendState=Running`** 이며, 로그는
   `%LOCALAPPDATA%\kmc\tailscale-setup.log`. 종료코드 0=연결, 2=설치됐지만 미연결, 3=설치 실패.
+- **GUI 안 뜸**: `/qn` 만으로는 부족하다 — Tailscale MSI 는 설치 마지막에 트레이 GUI 를 띄우고,
+  아직 `up` 전이라 로그인 창까지 함께 떴다. 실물 MSI 의 실행 시퀀스 조건이
+  `... AND (NOT TS_NOLAUNCH)` 라(신규 설치·업그레이드 양쪽) **`TS_NOLAUNCH=1`** 로 막는다.
+  함께 넣는 `TS_ONBOARDING_FLOW=hide` / `TS_UNATTENDEDMODE=always` 는
+  `HKLM\SOFTWARE\Policies\Tailscale` 정책으로 남아, 학생이 GUI 를 직접 실행해도 온보딩이 안 뜨고
+  unattended 를 끌 수 없다. MSI 프로퍼티는 설치 때만 적용되므로 "이미 설치됨" 경로에서는
+  같은 값을 레지스트리에 직접 쓴다. 승격 자식 콘솔도 `-WindowStyle Hidden` 이라 UAC 창만 보인다.
+  (`TS_AUTHKEY` 라는 MSI 프로퍼티는 존재하지 않는다 — 실물 MSI 확인. 로그인은 CLI `up` 뿐이다.)
 - **트레이 아이콘 숨김**: `tailscaled` 는 LocalSystem 서비스라 학생(비관리자)이 정지할 수 없지만
   (실측: `sc stop` 거부), `tailscale-ipn.exe` 는 사용자 세션 프로세스라 눈에 띄고 종료 가능하다.
   죽여도 `--unattended` 라 tailnet 은 유지되므로(실측: kill 15초 뒤에도 `Running` + 100.x 유지)

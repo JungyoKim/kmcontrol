@@ -97,11 +97,28 @@ if (-not (Test-Path $tsExe)) {
         }
     }
     if (Test-Path $msi) {
-        Log "installing tailscale (msiexec /qn)"
+        Log "installing tailscale (msiexec /qn, GUI 억제)"
         # 0=성공, 3010=설치됨(재부팅 권고). 그 외는 실패인데 예전엔 종료코드를 안 봤다.
-        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+        # TS_NOLAUNCH 가 없으면 /qn 이어도 설치 끝에 트레이 GUI + 로그인 창이 뜬다
+        # (실물 MSI 실행 시퀀스 조건이 `... AND (NOT TS_NOLAUNCH)`). 나머지 둘은
+        # HKLM\SOFTWARE\Policies\Tailscale 정책으로 남아 온보딩을 막고 unattended 를 고정한다.
+        $props = 'TS_NOLAUNCH=1 TS_ONBOARDING_FLOW=hide TS_UNATTENDEDMODE=always'
+        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart $props" -Wait -PassThru
         if ($p.ExitCode -notin 0, 3010) { Log "msiexec failed (exit=$($p.ExitCode))" }
     }
+}
+# MSI 프로퍼티는 "이미 설치돼 있어 MSI 를 건너뛴" 경로에 적용되지 않는다. provision 은
+# 관리자로 돌므로 같은 값을 직접 박아 설치 경로와 무관하게 동일 상태로 만든다.
+if (Test-Path $tsExe) {
+    # EAP=Continue 라 -ErrorAction Stop 없이는 권한 거부가 non-terminating 오류로 흘러
+    # catch 를 타지 않는다(실측: 키가 안 생기는데 로그는 조용함).
+    try {
+        $pol = 'HKLM:\SOFTWARE\Policies\Tailscale'
+        if (-not (Test-Path $pol)) { New-Item -Path $pol -Force -ErrorAction Stop | Out-Null }
+        Set-ItemProperty -Path $pol -Name 'UnattendedMode' -Value 'always' -Type String -ErrorAction Stop
+        Set-ItemProperty -Path $pol -Name 'OnboardingFlow' -Value 'hide'   -Type String -ErrorAction Stop
+        Log "tailscale policy set: UnattendedMode=always OnboardingFlow=hide"
+    } catch { Log "tailscale policy registry failed (ignored): $_" }
 }
 if ((Test-Path $tsExe) -and $AuthKey) {
     if (-not (Wait-TsBackend 30)) { Log "tailscaled unresponsive after 30s - trying up anyway" }
@@ -128,6 +145,7 @@ if ((Test-Path $tsExe) -and $AuthKey) {
 # 바로가기 하나뿐이다. WTG 이미지는 학생에게 넘어가므로 여기선 항상 제거한다.
 $tsLnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup\Tailscale.lnk'
 if (Test-Path $tsLnk) { Remove-Item $tsLnk -Force -ErrorAction SilentlyContinue; Log "removed tailscale tray autostart" }
+Get-Process tailscale-ipn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 # ---- 3. agent 실행 → /provision → 계정 이름 ----
 # agent 바이너리는 이미지의 C:\kmc\kmc-agent.exe 에 배치. --provision-only 모드로 이름만 획득.
