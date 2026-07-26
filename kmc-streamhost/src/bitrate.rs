@@ -44,6 +44,29 @@ const LOSS_EWMA_ALPHA: f64 = 0.3;
 /// 이 EWMA 손실률(0~1)에서 FEC 가 상한에 도달한다. 그 이하는 선형 보간.
 /// 낮게(0.10) 잡아 경미한 손실엔 빠르게 반응하되 상한 자체가 25% 라 폭증하지 않는다.
 const FEC_SATURATION_LOSS: f64 = 0.10;
+/// 손실 직후 이 시간 안에는 EWMA 를 감쇠시키지 않는다 — 한 번의 열화로 연속 도착하는
+/// 손실 프레임들을 하나의 사건으로 묶기 위한 유예.
+const LOSS_DECAY_GRACE_MS: u128 = 500;
+/// EWMA 손실률 감쇠 반감기(유예 이후 기준).
+const LOSS_HALF_LIFE_MS: f64 = 2000.0;
+
+/// 저장된 EWMA 손실률(= 마지막 손실 시점의 값)에 경과 시간 감쇠를 적용한다.
+///
+/// **순수 함수 — 호출해도 상태를 바꾸지 않는다.** 과거엔 `poll_fec_percentage` 안에서 감쇠분을
+/// 되저장했는데, 그러면 프레임마다 "마지막 손실 이후 총 경과" 기준 감쇠가 중복 적용돼
+/// 60fps 에선 0.7s 만에 3000배 붕괴했다(반감기 2s 라는 의도와 다르고, fps 에 따라 값이 달라짐).
+fn decayed_loss(raw: f64, since_loss_ms: Option<u128>) -> f64 {
+    let Some(since) = since_loss_ms else {
+        return 0.0; // 손실 관측 이력 없음.
+    };
+    if raw <= 0.0 {
+        return 0.0;
+    }
+    match since.checked_sub(LOSS_DECAY_GRACE_MS) {
+        None => raw, // 유예 구간.
+        Some(elapsed) => raw * 0.5_f64.powf(elapsed as f64 / LOSS_HALF_LIFE_MS),
+    }
+}
 
 struct Timing {
     last_loss: Option<Instant>,
@@ -127,13 +150,16 @@ impl BitrateController {
         }
         // EWMA 갱신은 스로틀과 무관하게 항상 수행 — FEC 는 모든 손실 신호를 반영해야 한다.
         let lf = loss_fraction.clamp(0.0, 1.0) as f64;
-        let prev = self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6;
-        let ewma = LOSS_EWMA_ALPHA * lf + (1.0 - LOSS_EWMA_ALPHA) * prev;
-        self.loss_ewma_ppm.store((ewma * 1e6) as u32, Ordering::Release);
-
         let min = self.min.load(Ordering::Acquire);
         let mut t = self.timing.lock();
         let now = Instant::now();
+        // 저장된 EWMA 는 "마지막 손실 시점의 값" 이므로, 그 사이 경과분을 감쇠시킨 뒤 섞는다.
+        let prev = decayed_loss(
+            self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6,
+            t.last_loss.map(|l| now.duration_since(l).as_millis()),
+        );
+        let ewma = LOSS_EWMA_ALPHA * lf + (1.0 - LOSS_EWMA_ALPHA) * prev;
+        self.loss_ewma_ppm.store((ewma * 1e6) as u32, Ordering::Release);
         t.last_loss = Some(now);
         if now.duration_since(t.last_decrease).as_millis() < DECREASE_THROTTLE_MS {
             return; // 버스트 스로틀 — 이미 최근에 낮췄음(EWMA 는 위에서 이미 갱신).
@@ -189,7 +215,10 @@ impl BitrateController {
             return cur;
         }
         // 잔여 손실 게이트: EWMA 손실이 남아있으면 회복하지 않는다(진동 방지).
-        let ewma = self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6;
+        let ewma = decayed_loss(
+            self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6,
+            t.last_loss.map(|l| now.duration_since(l).as_millis()),
+        );
         if ewma >= RECOVER_LOSS_GATE {
             return cur;
         }
@@ -225,17 +254,16 @@ impl BitrateController {
     /// 랜덤이 아니라 혼잡 때문이라 parity 증가는 전송량만 늘려 악화시킨다(측정으로 확인).
     /// FEC 는 "대역폭 여유가 있는데 랜덤 손실이 있을 때"만 올린다. 프레임마다 호출.
     pub fn poll_fec_percentage(&self) -> u32 {
-        // 시간 기반 감쇠: 마지막 손실 이후 경과에 따라 EWMA 를 지수 감쇠(반감기 ~2s).
+        // 시간 기반 감쇠(반감기 LOSS_HALF_LIFE_MS). **읽기 전용** — 감쇠 결과를 되저장하지
+        // 않는다. 이 함수는 프레임마다 불리므로, 되저장하면 감쇠 속도가 fps 에 비례해 버린다.
         let since_loss_ms = {
             let t = self.timing.lock();
-            t.last_loss.map_or(u128::MAX, |l| Instant::now().duration_since(l).as_millis())
+            t.last_loss.map(|l| Instant::now().duration_since(l).as_millis())
         };
-        let mut ewma = self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6;
-        if since_loss_ms > 500 && ewma > 0.0 {
-            let decay = 0.5_f64.powf(since_loss_ms as f64 / 2000.0);
-            ewma *= decay;
-            self.loss_ewma_ppm.store((ewma * 1e6) as u32, Ordering::Release);
-        }
+        let ewma = decayed_loss(
+            self.loss_ewma_ppm.load(Ordering::Acquire) as f64 / 1e6,
+            since_loss_ms,
+        );
         // 혼잡 게이트: target 이 floor 의 1.5배 이하(=대역폭 여유 거의 없음)면 FEC 최소.
         // 이때 손실은 혼잡 신호이므로 비트레이트 하향(poll_target)에 맡기고 parity 는 안 늘린다.
         let target = self.target.load(Ordering::Acquire);
@@ -454,6 +482,36 @@ mod tests {
         }
         let fec = c.poll_fec_percentage();
         assert!(fec < FEC_MAX_PCT, "FEC should decay after loss stops, got {fec}");
+    }
+
+    #[test]
+    fn loss_decay_matches_documented_half_life() {
+        // 유예(500ms) 안이면 감쇠 없음.
+        assert!((decayed_loss(0.2, Some(400)) - 0.2).abs() < 1e-9);
+        // 유예 이후 반감기 1회(2s) → 정확히 절반.
+        let half = decayed_loss(0.2, Some(LOSS_DECAY_GRACE_MS + 2000));
+        assert!((half - 0.1).abs() < 1e-6, "반감기가 문서와 다르다: {half}");
+        // 손실 이력 없음 → 0.
+        assert_eq!(decayed_loss(0.2, None), 0.0);
+    }
+
+    #[test]
+    fn fec_decay_is_independent_of_poll_rate() {
+        let c = BitrateController::default();
+        c.configure(20_000_000);
+        c.target.store(20_000_000, Ordering::Release);
+        c.loss_ewma_ppm.store((0.20 * 1e6) as u32, Ordering::Release);
+        {
+            let mut t = c.timing.lock();
+            t.last_loss = Some(Instant::now() - std::time::Duration::from_millis(600));
+        }
+        // 60fps 로 1초 폴링해도 값이 변하면 안 된다. (과거 버그: 매 호출 감쇠분을 되저장 →
+        // 호출 횟수만큼 붕괴 → 0.7s 만에 FEC 가 하한으로 떨어짐.)
+        let first = c.poll_fec_percentage();
+        for _ in 0..60 {
+            assert_eq!(c.poll_fec_percentage(), first, "폴링 횟수에 따라 FEC 가 변했다");
+        }
+        assert!(first > FEC_MIN_PCT, "600ms 경과인데 FEC 가 벌써 하한이다: {first}");
     }
 
     #[test]
