@@ -24,7 +24,7 @@
 ## 아키텍처 제약 (반드시 지킬 것)
 
 1. **`hub-server`는 영상/스트리밍 바이트를 절대 프록시하지 않는다.** 세션 인증·조율(누가 어느 노트북을 지금 제어 중인지, 권한 확인)만 담당하고, 실제 영상 데이터는 `admin-client` ↔ `agent` 간 직접 P2P(Tailscale)로 흐른다.
-2. `hub-server`는 tsnet(임베디드 Tailscale) 노드로 동작한다 — 가벼운 트래픽만 처리하므로 성능 제약 없음.
+2. ~~`hub-server`는 tsnet(임베디드 Tailscale) 노드로 동작한다~~ → **미채용. hub 는 tailnet 노드가 전혀 아니다** (`kmc-hub` 의존성·`deploy/hub/Dockerfile` 모두 Tailscale 0건). 공개 HTTPS(dokploy + Cloudflare, `https://kmc.xenv.cc`)로 서비스한다. 이유는 부트스트랩 닭-달걀이다: 한 줄 설치 `irm https://kmc.xenv.cc/enroll/<시크릿> | iex` 는 **Tailscale 이 아직 없는 맨 노트북**에서 실행돼 hub 로부터 authkey 를 받는다(그 다음에야 Tailscale 을 깐다). hub 가 tailnet 전용이면 그 노트북은 hub 에 닿을 수 없다. 제어 평면이 tailnet 과 무관해지는 부수효과도 있다 — Tailscale 이 깨져도 명령·상태는 계속 흐른다. **이 결정은 P2P 와 무관하다**(제약 1·3 참고): tsnet 이든 네이티브든 같은 WireGuard·같은 NAT 홀펀칭·같은 DERP 폴백을 쓰며, tsnet 은 "노드가 시스템 서비스냐 내 프로세스 안 라이브러리냐"의 차이일 뿐이다.
 3. `agent`와 `admin-client`는 **네이티브 Tailscale 클라이언트**가 설치돼 있어야 한다 (Sunshine 영상 트래픽이 tailnet IP를 직접 써야 하므로 tsnet 사용 불가).
 4. GUI 자동화 시 기본 디스패치는 **백그라운드**(대상 앱의 포커스를 뺏지 않음). 백그라운드 입력이 무시되는 앱일 경우에만 포그라운드로 폴백.
 5. 파괴적 명령(재부팅, 프로세스 강제 종료, 파일 삭제 등)은 `admin-client`에서 사용자 확인 단계를 거친 뒤에만 `agent`에 전달한다.
