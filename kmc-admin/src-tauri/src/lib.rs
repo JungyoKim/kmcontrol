@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -236,6 +237,69 @@ async fn run_command(
         .map_err(|e| format!("decode command result: {e}"))
 }
 
+/// 100.64.0.0/10 (CGNAT) = Tailscale 이 노드에 배정하는 대역.
+fn is_tailnet_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (64..128).contains(&o[1])
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// tailscaled 가 tailnet 에 붙어 있으면 항상 존재하는 MagicDNS 주소.
+/// Windows Tailscale 은 100.64/10 전체 경로를 깔지 않고 **피어별 /32** 만 깐다
+/// (실측 `Get-NetRoute 100.*`: 자기 /32, 피어 /32, 100.100.100.100/32). 그래서
+/// "tailnet 가입 여부"는 임의의 100.x 가 아니라 이 주소로 물어야 한다 —
+/// 실측: 미지 피어 100.99.1.2 는 가입 상태에서도 기본 게이트웨이로 떨어진다.
+const TAILNET_PROBE: IpAddr = IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100));
+
+/// 이 PC 가 `target` 으로 나갈 때 tailnet 인터페이스를 경유하는지.
+/// UDP `connect` 는 패킷을 보내지 않고 커널 라우팅만 질의하므로 부작용 없이 소스 IP 를
+/// 알 수 있다. tailscaled 가 없으면 기본 게이트웨이로 떨어져 소스가 192.168.x 등이 된다.
+fn routes_via_tailnet(target: IpAddr) -> bool {
+    UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|s| {
+            s.connect(SocketAddr::new(target, 47989))?;
+            s.local_addr()
+        })
+        .is_ok_and(|a| is_tailnet_ip(a.ip()))
+}
+
+/// 스트림 연결 실패가 tailnet 문제로 설명되면 그 이유를 덧붙인다.
+/// 노트북(agent)쪽 Tailscale 은 `install.ps1` 이 MSI 설치 + `up --unattended` 까지
+/// 책임지지만, **admin PC 는 수동 설치 전제**라(deploy/README.md:119) 여기서만 빠질 수
+/// 있다. 힌트가 없으면 화면에는 원시 연결 타임아웃만 떠서 원인 규명이 불가능하다.
+fn tailnet_hint(target: Option<IpAddr>) -> Option<String> {
+    let ip = target.filter(|ip| is_tailnet_ip(*ip))?;
+    // 프로브는 라우팅 조회뿐이라 값싸지만, 가입 여부가 먼저다(미가입이면 피어 경로도
+    // 당연히 없어 두 원인이 겹친다).
+    let on_tailnet = routes_via_tailnet(TAILNET_PROBE);
+    tailnet_hint_for(ip, on_tailnet, on_tailnet && routes_via_tailnet(ip))
+}
+
+/// `tailnet_hint` 의 순수 판정부(프로브 결과를 주입받아 테스트 가능).
+fn tailnet_hint_for(ip: IpAddr, on_tailnet: bool, peer_routed: bool) -> Option<String> {
+    if !on_tailnet {
+        return Some(
+            "이 PC 가 Tailscale tailnet 에 연결돼 있지 않습니다. Tailscale 설치 후 \
+             `tailscale up --advertise-tags=tag:admin` 으로 로그인하세요."
+                .into(),
+        );
+    }
+    if !peer_routed {
+        // 가입은 돼 있는데 그 피어만 netmap 에 없다. 단순 오프라인은 여기 걸리지 않는다
+        // (실측: 오프라인 피어도 /32 경로는 남는다) — 노드 만료/삭제나 ACL 가림이다.
+        return Some(format!(
+            "tailnet 에는 연결돼 있으나 {ip} 노드가 보이지 않습니다 \
+             (노드 만료·삭제 또는 ACL 로 가려짐). Tailscale 콘솔에서 해당 노트북 노드와 \
+             tag:admin -> tag:camp-laptop 규칙을 확인하세요."
+        ));
+    }
+    None
+}
+
 /// 스트림 시작. `address`=호스트 IP, `pin`=페어링 필요 시 4자리(이미 페어링됐으면 무시).
 /// 블로킹 FFI(LiStartConnection)를 spawn_blocking으로 감싸 UI 스레드를 막지 않는다.
 #[tauri::command]
@@ -249,11 +313,19 @@ async fn start_stream(
     allow_hevc: Option<bool>,
 ) -> Result<(), String> {
     let allow_hevc = allow_hevc.unwrap_or(false);
+    let target = address
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| address.parse::<SocketAddr>().ok().map(|s| s.ip()));
     let st = stream.inner().clone();
     let r = tokio::task::spawn_blocking(move || st.start(&address, width, height, fps, pin, allow_hevc))
         .await
         .map_err(|e| format!("join: {e}"))?
-        .map_err(|e| format!("start_stream: {e}"));
+        .map_err(|e| format!("start_stream: {e}"))
+        .map_err(|e| match tailnet_hint(target) {
+            Some(hint) => format!("{e}\n\n{hint}"),
+            None => e,
+        });
     #[cfg(windows)]
     if r.is_ok() {
         // 연결 버튼을 방금 눌렀으니 admin 이 포커스 상태 — 시드로 설정(이후 Focused 이벤트가 갱신).
@@ -359,4 +431,61 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// tailnet 판정은 100.64.0.0/10 경계가 전부다. `o[0]==100` 만 보거나 상한을 128 로
+    /// 포함하면 일반 사설망(100.128.x 등)을 tailnet 으로 오인해 엉뚱한 안내가 뜬다.
+    #[test]
+    fn tailnet_ip_matches_cgnat_range_only() {
+        for s in ["100.64.0.0", "100.64.0.1", "100.100.100.100", "100.127.255.255"] {
+            assert!(is_tailnet_ip(s.parse().unwrap()), "{s} 는 100.64/10 안");
+        }
+        for s in ["100.63.255.255", "100.128.0.0", "99.64.0.1", "101.64.0.1", "192.168.1.10", "127.0.0.1"] {
+            assert!(!is_tailnet_ip(s.parse().unwrap()), "{s} 는 100.64/10 밖");
+        }
+        assert!(!is_tailnet_ip("fd7a:115c:a1e0::1".parse().unwrap()), "IPv6 는 대상 아님");
+    }
+
+    /// 두 원인은 조치가 다르다(내 PC 에 Tailscale 설치 vs 콘솔에서 노드/ACL 확인).
+    /// 분기를 뒤집으면 tailnet 에 멀쩡히 붙은 관리자에게 "설치하세요"가 떠서 오히려
+    /// 헛짚게 된다.
+    #[test]
+    fn tailnet_hint_distinguishes_missing_tailnet_from_missing_peer() {
+        let ip: IpAddr = "100.101.102.103".parse().unwrap();
+
+        let not_joined = tailnet_hint_for(ip, false, false).expect("미가입이면 안내");
+        assert!(not_joined.contains("tailscale up"), "설치/로그인 조치를 제시해야 함");
+        assert!(!not_joined.contains("ACL"), "미가입인데 ACL 을 의심시키면 안 됨");
+
+        let peer_gone = tailnet_hint_for(ip, true, false).expect("피어 미인지면 안내");
+        assert!(peer_gone.contains("ACL"), "노드/ACL 확인을 제시해야 함");
+        assert!(!peer_gone.contains("tailscale up"), "이미 가입 상태를 오진하면 안 됨");
+        assert!(peer_gone.contains("100.101.102.103"), "어느 노드인지 밝혀야 함");
+
+        assert!(tailnet_hint_for(ip, true, true).is_none(), "정상 경로면 원시 오류만");
+    }
+
+    /// LAN(비-tailnet) 대상 실패까지 tailnet 탓으로 돌리면 오히려 오진이다.
+    /// 이 경로는 프로브를 아예 타지 않아 환경과 무관하게 결정적이다.
+    #[test]
+    fn tailnet_hint_ignores_non_tailnet_targets() {
+        assert!(tailnet_hint(Some("192.168.10.20".parse().unwrap())).is_none());
+        assert!(tailnet_hint(None).is_none());
+    }
+
+    /// 라이브 프로브 검증(이 PC 가 tailnet 노드일 때만 유효) — 기본 실행 제외.
+    /// `cargo test --lib -- --ignored --nocapture`
+    #[test]
+    #[ignore = "로컬 tailnet 가입 상태에 의존"]
+    fn live_tailnet_probe_has_no_false_positive() {
+        assert!(
+            routes_via_tailnet(TAILNET_PROBE),
+            "이 PC 가 tailnet 에 붙어 있는데 프로브가 실패하면 관리자에게 헛안내가 나간다"
+        );
+        assert!(!routes_via_tailnet("8.8.8.8".parse().unwrap()), "공인 IP 는 tailnet 경로가 아님");
+    }
 }
